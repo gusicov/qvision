@@ -1,9 +1,10 @@
 import SwiftUI
 
-/// Layers UI. Used twice:
-/// - compact = true: the floating panel in the stage (RealityView attachment, ~420x560 pt),
-///   with a "Layers" header and a close button.
-/// - compact = false: embedded in the main panel (ProjectWorkspaceView).
+/// Layers UI.
+/// - compact = false: the content of the movable Layers window (LayersWindowView wraps it in a
+///   ScrollView inside a NavigationStack titled "Layers").
+/// - compact = true: a self-contained ~420x560 pt panel with its own "Layers" header and scroll
+///   view, for embedding somewhere without a window (no longer used by the stage in v0.3).
 ///
 /// Renaming is inline (TextField in the row) rather than an alert, because alerts are not
 /// reliable from views hosted as RealityView attachments.
@@ -44,16 +45,8 @@ struct LayersPanelView: View {
             Label("Layers", systemImage: "square.3.layers.3d")
                 .font(.title2.weight(.semibold))
             Spacer(minLength: 8)
-            Button {
-                model.isLayersPanelVisible = false
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 44, height: 44)
-            }
-            .buttonBorderShape(.circle)
-            .accessibilityLabel("Close Layers")
         }
+        .frame(minHeight: 44)
     }
 
     // MARK: - Content

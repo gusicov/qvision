@@ -2,34 +2,35 @@ import SwiftUI
 import RealityKit
 import simd
 
-/// Contents of the ImmersiveSpace: the stage, the fly indicator, the palm "Layers" button
-/// and the floating Layers panel, plus direct-manipulation gestures on items.
+/// Contents of the ImmersiveSpace: the stage, the fly indicator and the hand panel
+/// (the project panel next to the LEFT palm), plus direct-manipulation gestures on items.
 struct StageView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     @State private var updateSubscription: EventSubscription?
     @State private var attachmentState = StageAttachmentState()
     @State private var gestureState = StageGestureState()
 
-    private static let palmMenuID = "palmMenu"
-    private static let layersPanelID = "layersPanel"
+    private static let handPanelID = "handPanel"
+
+    // Hand panel tuning (meters / seconds).
+    private static let panelRightOffset: Float = 0.17
+    private static let panelUpOffset: Float = 0.06
+    private static let panelFollowRate: Float = 14
+    private static let panelGracePeriod: Float = 0.8
+    private static let panelWidth: Float = 0.30
 
     var body: some View {
         RealityView { content, attachments in
             content.add(model.stage.root)
             content.add(model.fly.indicator)
 
-            if let palm = attachments.entity(for: Self.palmMenuID) {
-                palm.components.set(BillboardComponent())
-                palm.isEnabled = false
-                content.add(palm)
-                attachmentState.palmMenu = palm
-            }
-            if let panel = attachments.entity(for: Self.layersPanelID) {
+            if let panel = attachments.entity(for: Self.handPanelID) {
                 panel.components.set(BillboardComponent())
                 panel.isEnabled = false
                 content.add(panel)
-                attachmentState.layersPanel = panel
+                attachmentState.handPanel = panel
             }
 
             let frameModel = model
@@ -43,14 +44,10 @@ struct StageView: View {
         } update: { _, _ in
             // Everything dynamic is driven per frame by the SceneEvents.Update subscription.
         } attachments: {
-            Attachment(id: Self.palmMenuID) {
-                palmMenuButton
-            }
-            Attachment(id: Self.layersPanelID) {
-                LayersPanelView(compact: true)
+            Attachment(id: Self.handPanelID) {
+                // ProjectPanelView applies its own glass background in the .hand context.
+                ProjectPanelView(context: .hand)
                     .environment(model)
-                    .frame(width: 420, height: 560)
-                    .glassBackgroundEffect()
             }
         }
         .gesture(dragGesture)
@@ -60,6 +57,12 @@ struct StageView: View {
         .task {
             await model.hands.start()
         }
+        .task {
+            // Fallback: without hand tracking there's no hand panel, so bring the main window back.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            openFallbackWindowIfNeeded()
+        }
         .onDisappear {
             model.hands.stop()
             updateSubscription?.cancel()
@@ -67,19 +70,13 @@ struct StageView: View {
         }
     }
 
-    // MARK: - Attachments
-
-    private var palmMenuButton: some View {
-        Button {
-            model.isLayersPanelVisible.toggle()
-        } label: {
-            Label("Layers", systemImage: "square.3.layers.3d")
-                .labelStyle(.titleAndIcon)
-                .font(.callout.weight(.semibold))
-                .padding(.horizontal, 4)
-        }
-        .buttonBorderShape(.capsule)
-        .glassBackgroundEffect(in: Capsule())
+    private func openFallbackWindowIfNeeded() {
+        let state = attachmentState
+        guard !state.didOpenFallbackWindow, model.hands.status != .running else { return }
+        state.didOpenFallbackWindow = true
+        // Orchestrator integration: never open a second copy of the main window.
+        guard !model.isMainWindowOpen else { return }
+        openWindow(id: AppModel.mainWindowID)
     }
 
     // MARK: - Per-frame update
@@ -88,60 +85,79 @@ struct StageView: View {
     private static func updateFrame(model: AppModel, state: StageAttachmentState, deltaTime: Float) {
         let dt = Swift.min(Swift.max(deltaTime, 0), 0.1)
         model.fly.update(deltaTime: dt, worldRoot: model.stage.worldRoot)
-
-        let pose = model.hands.devicePose()
-        let head: SIMD3<Float>? = pose.map { SIMD3<Float>($0.columns.3.x, $0.columns.3.y, $0.columns.3.z) }
-
-        updatePalmMenu(model: model, state: state, head: head)
-        updateLayersPanel(model: model, state: state, pose: pose)
+        updateHandPanel(model: model, state: state, pose: model.hands.devicePose(), dt: dt)
     }
 
     @MainActor
-    private static func updatePalmMenu(model: AppModel, state: StageAttachmentState, head: SIMD3<Float>?) {
-        guard let palm = state.palmMenu else { return }
-        let left = model.hands.left
-        guard left.isTracked, left.palmFacingUser, let head else {
-            if palm.isEnabled { palm.isEnabled = false }
+    private static func updateHandPanel(model: AppModel, state: StageAttachmentState, pose: simd_float4x4?, dt: Float) {
+        guard let panel = state.handPanel else { return }
+        state.clock += dt
+
+        // Pinned: frozen where it is, always visible, no following.
+        if model.isHandPanelPinned {
+            if !state.hasPlacedPanel {
+                panel.setPosition(floatingPanelPosition(pose: pose), relativeTo: nil)
+                state.hasPlacedPanel = true
+            }
+            showPanel(panel, state: state)
+            state.lastPalmSeen = state.clock
             return
         }
-        let toHead = head - left.palmCenter
-        let distance = simd_length(toHead)
-        let direction = distance > 0.0001 ? toHead / distance : SIMD3<Float>(0, 0, 1)
-        palm.setPosition(left.palmCenter + direction * 0.06, relativeTo: nil)
-        // Orientation: BillboardComponent keeps the button facing the viewer.
-        if !palm.isEnabled { palm.isEnabled = true }
+
+        let left = model.hands.left
+        if left.isTracked && left.palmFacingUser {
+            let right = headRight(pose: pose)
+            let target = left.palmCenter
+                + right * panelRightOffset
+                + SIMD3<Float>(0, panelUpOffset, 0)
+
+            if !panel.isEnabled || !state.hasPlacedPanel {
+                // Appear in place (no fly-in from the last spot).
+                panel.setPosition(target, relativeTo: nil)
+                state.hasPlacedPanel = true
+            } else {
+                let current = panel.position(relativeTo: nil)
+                let t = 1 - exp(-dt * panelFollowRate)
+                panel.setPosition(current + (target - current) * t, relativeTo: nil)
+            }
+            state.lastPalmSeen = state.clock
+            showPanel(panel, state: state)
+        } else if panel.isEnabled, state.clock - state.lastPalmSeen > panelGracePeriod {
+            panel.isEnabled = false
+        }
     }
 
+    /// Shows the panel and, the first time its size is known, scales it to ~0.30 m wide.
     @MainActor
-    private static func updateLayersPanel(model: AppModel, state: StageAttachmentState, pose: simd_float4x4?) {
-        guard let panel = state.layersPanel else { return }
-        let wantsVisible = model.isLayersPanelVisible
-
-        if wantsVisible && !state.panelWasVisible {
-            panel.setPosition(layersPanelPosition(pose: pose, left: model.hands.left), relativeTo: nil)
+    private static func showPanel(_ panel: Entity, state: StageAttachmentState) {
+        if !panel.isEnabled {
+            panel.isEnabled = true
         }
-        state.panelWasVisible = wantsVisible
-        if panel.isEnabled != wantsVisible {
-            panel.isEnabled = wantsVisible
-        }
+        guard !state.panelScaled else { return }
+        // Local bounds (the entity's own scale isn't applied).
+        let bounds = panel.visualBounds(relativeTo: panel)
+        let width = bounds.extents.x
+        guard !bounds.isEmpty, width.isFinite, width > 0.01 else { return }
+        panel.scale = SIMD3<Float>(repeating: panelWidth / width)
+        state.panelScaled = true
     }
 
-    /// ~0.45 m in front of the head, slightly to the left, at eye height (world space).
-    private static func layersPanelPosition(pose: simd_float4x4?, left: HandState) -> SIMD3<Float> {
-        if let pose {
-            let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
-            var forward = SIMD3<Float>(-pose.columns.2.x, 0, -pose.columns.2.z)
-            let length = simd_length(forward)
-            forward = length > 0.001 ? forward / length : SIMD3<Float>(0, 0, -1)
-            let right = SIMD3<Float>(-forward.z, 0, forward.x)
-            var point = head + forward * 0.45 - right * 0.12
-            point.y = head.y
-            return point
-        }
-        if left.isTracked {
-            return left.palmCenter + SIMD3<Float>(0, 0.2, 0)
-        }
-        return SIMD3<Float>(-0.12, 1.45, -0.45)
+    /// Head right vector flattened to XZ (column 0 of the device pose).
+    private static func headRight(pose: simd_float4x4?) -> SIMD3<Float> {
+        guard let pose else { return SIMD3<Float>(1, 0, 0) }
+        let right = SIMD3<Float>(pose.columns.0.x, 0, pose.columns.0.z)
+        let length = simd_length(right)
+        return length > 0.001 ? right / length : SIMD3<Float>(1, 0, 0)
+    }
+
+    /// Used only when the panel is pinned before it was ever shown: ~0.5 m in front of the head.
+    private static func floatingPanelPosition(pose: simd_float4x4?) -> SIMD3<Float> {
+        guard let pose else { return SIMD3<Float>(0, 1.3, -0.6) }
+        let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
+        var forward = SIMD3<Float>(-pose.columns.2.x, 0, -pose.columns.2.z)
+        let length = simd_length(forward)
+        forward = length > 0.001 ? forward / length : SIMD3<Float>(0, 0, -1)
+        return head + forward * 0.5 + SIMD3<Float>(0, -0.15, 0)
     }
 
     // MARK: - Gestures
@@ -159,11 +175,16 @@ struct StageView: View {
         return nil
     }
 
+    private var isEditing: Bool {
+        model.interactionMode == .edit
+    }
+
     private var dragGesture: some Gesture {
         DragGesture()
             .targetedToAnyEntity()
             .onChanged { value in
-                guard let hit = Self.itemRoot(of: value.entity),
+                guard isEditing,
+                      let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
@@ -178,6 +199,9 @@ struct StageView: View {
                       let startPosition = state.dragStartPosition else { return }
                 let current = value.convert(value.location3D, from: .local, to: .scene)
                 root.setPosition(startPosition + (current - startScene), relativeTo: nil)
+                if model.snapToFloor {
+                    model.stage.snapToFloorIfClose(id, worldThreshold: 0.10)
+                }
             }
             .onEnded { value in
                 let state = gestureState
@@ -192,7 +216,8 @@ struct StageView: View {
         MagnifyGesture()
             .targetedToAnyEntity()
             .onChanged { value in
-                guard let hit = Self.itemRoot(of: value.entity),
+                guard isEditing,
+                      let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
@@ -225,7 +250,8 @@ struct StageView: View {
         RotateGesture3D(constrainedToAxis: .y)
             .targetedToAnyEntity()
             .onChanged { value in
-                guard let hit = Self.itemRoot(of: value.entity),
+                guard isEditing,
+                      let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
@@ -259,7 +285,12 @@ struct StageView: View {
             .onEnded { value in
                 guard let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
-                model.select(hit.id)
+                if model.interactionMode == .inspect {
+                    let partID = model.stage.partID(for: value.entity, itemID: hit.id)
+                    model.selectPart(itemID: hit.id, partID: partID)
+                } else {
+                    model.select(hit.id)
+                }
             }
     }
 
@@ -270,11 +301,15 @@ struct StageView: View {
 
 // MARK: - State holders
 
-/// Entities of the RealityView attachments, read by the per-frame update.
+/// Entities of the RealityView attachments and hand-panel state, read by the per-frame update.
 final class StageAttachmentState {
-    var palmMenu: Entity?
-    var layersPanel: Entity?
-    var panelWasVisible = false
+    var handPanel: Entity?
+    var hasPlacedPanel = false
+    var panelScaled = false
+    /// Accumulated frame time (s) and the last time the left palm faced the user.
+    var clock: Float = 0
+    var lastPalmSeen: Float = 0
+    var didOpenFallbackWindow = false
 }
 
 /// Start values of the running gestures (cleared in every `onEnded`).

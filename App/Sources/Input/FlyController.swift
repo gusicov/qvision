@@ -7,7 +7,7 @@ import simd
 ///
 /// Clench BOTH fists to grab. While held:
 /// - moving the fists' midpoint away from where you clenched flies you in that direction
-///   (speed proportional to distance, with a deadzone and a max speed);
+///   (nonlinear speed curve: precise near the grab point, much faster farther out; deadzone + cap);
 /// - twisting the fists around each other like a horizontal steering wheel turns you
 ///   (right fist forward / left fist back = turn left).
 /// Opening either hand releases; motion then decays smoothly to zero.
@@ -35,6 +35,10 @@ import simd
     private let hands: HandTrackingService
     private let ring: ModelEntity
     private let arrow: ModelEntity
+    /// Pre-built materials per speed bucket (cyan -> white), so a bucket change only swaps arrays.
+    private let ringMaterials: [UnlitMaterial]
+    private let arrowMaterials: [UnlitMaterial]
+    private var speedBucket: Int = 0
 
     private var grabMidpoint: SIMD3<Float> = .zero     // M0, world space
     private var grabYaw: Float = 0                     // θ0
@@ -50,13 +54,20 @@ import simd
 
     // MARK: Tuning
 
-    private static let translationDeadzone: Float = 0.03       // m
-    private static let translationGain: Float = 4               // (m/s) per m, × speed
-    private static let maxSpeed: Float = 3                      // m/s, × speed
+    // Translation: x = max(0, |d| - deadzone);  speed(x) = (linear·x + quadratic·x²) · speed, capped.
+    private static let translationDeadzone: Float = 0.025      // m
+    private static let translationLinearGain: Float = 2.5       // (m/s) per m, × speed
+    private static let translationQuadraticGain: Float = 45     // (m/s) per m², × speed
+    private static let maxSpeed: Float = 14                     // m/s, × speed
+    // Yaw: a = max(0, |Δθ| - deadzone);  ω = linear·a + quadratic·a², capped.
     private static let yawDeadzone: Float = 5 * Float.pi / 180  // rad
-    private static let yawGain: Float = 1.5                     // (rad/s) per rad
-    private static let maxYawRate: Float = 1.2                  // rad/s
-    private static let damping: Float = 8                       // 1/s, exponential smoothing rate
+    private static let yawLinearGain: Float = 1.2               // (rad/s) per rad
+    private static let yawQuadraticGain: Float = 2.0            // (rad/s) per rad²
+    private static let maxYawRate: Float = 1.6                  // rad/s
+    /// Exponential smoothing rate while the grab is held (speed-up / steering).
+    private static let holdDamping: Float = 10                  // 1/s
+    /// Exponential smoothing rate after release (fists opened): smooth stop.
+    private static let releaseDamping: Float = 6                // 1/s
     private static let maxDeltaTime: Float = 0.05               // s
     /// A hand that briefly LOSES TRACKING (fists self-occlude) does not end the grab for this long.
     /// A hand that is tracked and OPEN ends it immediately.
@@ -65,6 +76,15 @@ import simd
     private static let minYawBarLength: Float = 0.08            // m
     private static let restEpsilon: Float = 0.001
     private static let arrowMinSpeed: Float = 0.05              // m/s
+    // Indicator feedback.
+    private static let ringRadius: Float = 0.05                 // m
+    private static let arrowGap: Float = 0.01                   // m between ring edge and arrow base
+    private static let arrowMeshLength: Float = 0.04            // m, unscaled cone height
+    private static let arrowMinLength: Float = 0.03             // m, at rest
+    private static let arrowMaxLength: Float = 0.12             // m, at >= arrowFullSpeed
+    private static let arrowFullSpeed: Float = 5                // m/s
+    /// Upper bounds (m/s) of speed buckets 0...2; bucket 3 is everything above the last one.
+    private static let speedBucketLimits: [Float] = [0.75, 2, 5]
 
     // MARK: Init
 
@@ -74,28 +94,43 @@ import simd
         let root = Entity()
         root.name = "FlyIndicator"
 
-        let cyan = UIColor(red: 0.2, green: 0.9, blue: 1.0, alpha: 1.0)
+        // Tint per speed bucket: cyan at rest -> white at high speed.
+        let bucketCount = FlyController.speedBucketLimits.count + 1
+        var ringMats: [UnlitMaterial] = []
+        var arrowMats: [UnlitMaterial] = []
+        for i in 0..<bucketCount {
+            let t = CGFloat(i) / CGFloat(bucketCount - 1)
+            let color = UIColor(
+                red: 0.2 + 0.8 * t,
+                green: 0.9 + 0.1 * t,
+                blue: 1.0,
+                alpha: 1.0
+            )
+            var ringMat = UnlitMaterial(color: color)
+            ringMat.blending = .transparent(opacity: .init(floatLiteral: 0.6))
+            ringMats.append(ringMat)
+            var arrowMat = UnlitMaterial(color: color)
+            arrowMat.blending = .transparent(opacity: .init(floatLiteral: 0.85))
+            arrowMats.append(arrowMat)
+        }
 
         // Ring: a thin flat cylinder (disc), lying horizontally (cylinder axis = +Y).
-        var ringMaterial = UnlitMaterial(color: cyan)
-        ringMaterial.blending = .transparent(opacity: .init(floatLiteral: 0.6))
         let ring = ModelEntity(
-            mesh: MeshResource.generateCylinder(height: 0.004, radius: 0.05),
-            materials: [ringMaterial]
+            mesh: MeshResource.generateCylinder(height: 0.004, radius: FlyController.ringRadius),
+            materials: [ringMats[0]]
         )
         ring.name = "FlyIndicator.ring"
         root.addChild(ring)
 
-        // Arrow: a cone along +Y (visionOS 2), box fallback. Oriented along the velocity each frame.
-        var arrowMaterial = UnlitMaterial(color: cyan)
-        arrowMaterial.blending = .transparent(opacity: .init(floatLiteral: 0.85))
+        // Arrow: a cone along +Y (visionOS 2), box fallback. Oriented along the velocity each frame,
+        // and stretched along its local Y to show the current speed.
         let arrowMesh: MeshResource
         if #available(visionOS 2.0, *) {
-            arrowMesh = MeshResource.generateCone(height: 0.04, radius: 0.012)
+            arrowMesh = MeshResource.generateCone(height: FlyController.arrowMeshLength, radius: 0.012)
         } else {
-            arrowMesh = MeshResource.generateBox(width: 0.016, height: 0.04, depth: 0.016)
+            arrowMesh = MeshResource.generateBox(width: 0.016, height: FlyController.arrowMeshLength, depth: 0.016)
         }
-        let arrow = ModelEntity(mesh: arrowMesh, materials: [arrowMaterial])
+        let arrow = ModelEntity(mesh: arrowMesh, materials: [arrowMats[0]])
         arrow.name = "FlyIndicator.arrow"
         arrow.isEnabled = false
         root.addChild(arrow)
@@ -104,6 +139,8 @@ import simd
 
         self.ring = ring
         self.arrow = arrow
+        self.ringMaterials = ringMats
+        self.arrowMaterials = arrowMats
         self.indicator = root
     }
 
@@ -145,8 +182,10 @@ import simd
             }
         }
 
-        // Exponential (critically damped style) smoothing toward the target; on release target = 0.
-        let alpha = 1 - exp(-dt * Self.damping)
+        // Exponential smoothing toward the target: snappy while held, gentler after release
+        // (target = 0) so stopping stays smooth.
+        let rate = isFlying ? Self.holdDamping : Self.releaseDamping
+        let alpha = 1 - exp(-dt * rate)
         velocity += (targetVelocity - velocity) * alpha
         yawRate += (targetYawRate - yawRate) * alpha
         if !isFlying {
@@ -212,20 +251,18 @@ import simd
         yawRate = 0
     }
 
-    /// v = d' * gain, |v| <= maxSpeed. Direction is exactly where the fists moved.
+    /// x = |d| - deadzone,  |v| = (2.5·x + 45·x²)·speed,  |v| <= 14·speed.
+    /// Direction is exactly where the fists moved (d normalised).
     private func translationTarget(midpoint: SIMD3<Float>) -> SIMD3<Float> {
         let s = max(0, speed)
+        guard s > 0 else { return .zero }
         let d = midpoint - grabMidpoint
         let length = simd_length(d)
         guard length > Self.translationDeadzone else { return .zero }
-        let dPrime = d * ((length - Self.translationDeadzone) / length)
-        var v = dPrime * (Self.translationGain * s)
-        let maxV = Self.maxSpeed * s
-        let vLength = simd_length(v)
-        if vLength > maxV && vLength > 0 {
-            v *= maxV / vLength
-        }
-        return v
+        let x = length - Self.translationDeadzone
+        let curve = Self.translationLinearGain * x + Self.translationQuadraticGain * x * x
+        let magnitude = min(curve * s, Self.maxSpeed * s)
+        return d * (magnitude / length)
     }
 
     /// ω from the twist of the right->left fist vector around the vertical axis.
@@ -241,9 +278,9 @@ import simd
             return 0
         }
         let delta = Self.wrapAngle(theta - grabYaw)
-        let magnitude = max(0, abs(delta) - Self.yawDeadzone)
-        let omega = (delta < 0 ? -magnitude : magnitude) * Self.yawGain
-        return min(max(omega, -Self.maxYawRate), Self.maxYawRate)
+        let a = max(0, abs(delta) - Self.yawDeadzone)
+        let rate = min(Self.yawLinearGain * a + Self.yawQuadraticGain * a * a, Self.maxYawRate)
+        return delta < 0 ? -rate : rate
     }
 
     private func currentHeadPosition() -> SIMD3<Float>? {
@@ -263,14 +300,36 @@ import simd
         indicator.setPosition(grabMidpoint, relativeTo: nil)
 
         let vLength = simd_length(velocity)
+        setSpeedBucket(Self.bucket(forSpeed: vLength))
+
         if vLength > Self.arrowMinSpeed {
             let direction = velocity / vLength
-            arrow.isEnabled = true
-            arrow.position = direction * 0.085
+            let t = min(vLength / Self.arrowFullSpeed, 1)
+            let arrowLength = Self.arrowMinLength + (Self.arrowMaxLength - Self.arrowMinLength) * t
+            if !arrow.isEnabled { arrow.isEnabled = true }
+            // Mesh is centred on its origin: put the base just outside the ring.
+            arrow.position = direction * (Self.ringRadius + Self.arrowGap + arrowLength * 0.5)
             arrow.orientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: direction)
+            arrow.scale = SIMD3<Float>(1, arrowLength / Self.arrowMeshLength, 1)
         } else if arrow.isEnabled {
             arrow.isEnabled = false
         }
+    }
+
+    /// Swaps the tint materials only when the bucket actually changes.
+    private func setSpeedBucket(_ bucket: Int) {
+        guard bucket != speedBucket,
+              bucket >= 0, bucket < ringMaterials.count, bucket < arrowMaterials.count else { return }
+        speedBucket = bucket
+        ring.model?.materials = [ringMaterials[bucket]]
+        arrow.model?.materials = [arrowMaterials[bucket]]
+    }
+
+    private static func bucket(forSpeed v: Float) -> Int {
+        for (i, limit) in speedBucketLimits.enumerated() where v < limit {
+            return i
+        }
+        return speedBucketLimits.count
     }
 
     private func hideIndicator() {

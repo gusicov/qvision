@@ -62,14 +62,24 @@ struct HandState: Equatable {
     // Hysteresis latches.
     @ObservationIgnored private var leftFistLatched = false
     @ObservationIgnored private var rightFistLatched = false
+    /// Raw hysteresis latch of the palm-facing test (before the minimum-hold debounce).
     @ObservationIgnored private var leftPalmLatched = false
     @ObservationIgnored private var rightPalmLatched = false
+    /// Debounced value actually published in `HandState.palmFacingUser`.
+    @ObservationIgnored private var leftPalmOutput = false
+    @ObservationIgnored private var rightPalmOutput = false
+    /// When the raw latch first disagreed with the published value (nil = they agree).
+    @ObservationIgnored private var leftPalmPendingSince: CFTimeInterval?
+    @ObservationIgnored private var rightPalmPendingSince: CFTimeInterval?
 
     // Tuning.
     private static let fistEnterDistance: Float = 0.075   // all four tips closer than this -> fist
     private static let fistExitDistance: Float = 0.095    // any tip farther than this -> open
-    private static let palmFacingEnter: Float = 0.6       // cos(angle) palm normal vs. direction to head
-    private static let palmFacingExit: Float = 0.5        // small hysteresis so the palm button doesn't flicker
+    private static let palmFacingEnter: Float = 0.55      // cos(angle) palm normal vs. direction to head: > enter -> facing
+    private static let palmFacingExit: Float = 0.35       // < exit -> not facing (wide hysteresis band)
+    /// A change of the raw palm latch must persist this long before it is published, so every
+    /// published state lasts at least this long (no single-frame flicker of the hand panel).
+    private static let palmFacingMinHold: CFTimeInterval = 0.12
 
     init() {}
 
@@ -196,6 +206,10 @@ struct HandState: Equatable {
         rightFistLatched = false
         leftPalmLatched = false
         rightPalmLatched = false
+        leftPalmOutput = false
+        rightPalmOutput = false
+        leftPalmPendingSince = nil
+        rightPalmPendingSince = nil
     }
 
     private func handle(_ update: AnchorUpdate<HandAnchor>) {
@@ -221,10 +235,41 @@ struct HandState: Equatable {
         if isLeft {
             leftFistLatched = false
             leftPalmLatched = false
+            leftPalmOutput = false
+            leftPalmPendingSince = nil
         } else {
             rightFistLatched = false
             rightPalmLatched = false
+            rightPalmOutput = false
+            rightPalmPendingSince = nil
         }
+    }
+
+    /// Minimum-hold debounce: the published value follows `raw` only after `raw` has disagreed
+    /// with it continuously for `palmFacingMinHold` seconds.
+    private func debouncedPalmFacing(raw: Bool, isLeft: Bool, now: CFTimeInterval) -> Bool {
+        var output = isLeft ? leftPalmOutput : rightPalmOutput
+        var pendingSince = isLeft ? leftPalmPendingSince : rightPalmPendingSince
+
+        if raw == output {
+            pendingSince = nil
+        } else if let since = pendingSince {
+            if now - since >= Self.palmFacingMinHold {
+                output = raw
+                pendingSince = nil
+            }
+        } else {
+            pendingSince = now
+        }
+
+        if isLeft {
+            leftPalmOutput = output
+            leftPalmPendingSince = pendingSince
+        } else {
+            rightPalmOutput = output
+            rightPalmPendingSince = pendingSince
+        }
+        return output
     }
 
     private func makeState(from anchor: HandAnchor, isLeft: Bool) -> HandState {
@@ -280,7 +325,10 @@ struct HandState: Equatable {
         if isLeft { palmNormal = -palmNormal }
 
         // MARK: Palm facing the user
-        var facing = false
+        // 1) Hysteresis latch: enter > 0.55, exit < 0.35. If the alignment can't be measured this
+        //    frame (no head pose, degenerate geometry) the latch keeps its previous value.
+        // 2) Minimum-hold debounce on top, so the published value never flickers.
+        var rawFacing = isLeft ? leftPalmLatched : rightPalmLatched
         let normalLength = simd_length(palmNormal)
         if normalLength > 1e-6, let pose = devicePose() {
             let head = Self.translation(of: pose)
@@ -288,11 +336,15 @@ struct HandState: Equatable {
             let distance = simd_length(toHead)
             if distance > 1e-4 {
                 let alignment = simd_dot(palmNormal / normalLength, toHead / distance)
-                let wasFacing = isLeft ? leftPalmLatched : rightPalmLatched
-                facing = wasFacing ? alignment > Self.palmFacingExit : alignment > Self.palmFacingEnter
+                if rawFacing {
+                    if alignment < Self.palmFacingExit { rawFacing = false }
+                } else {
+                    if alignment > Self.palmFacingEnter { rawFacing = true }
+                }
             }
         }
-        if isLeft { leftPalmLatched = facing } else { rightPalmLatched = facing }
+        if isLeft { leftPalmLatched = rawFacing } else { rightPalmLatched = rawFacing }
+        let facing = debouncedPalmFacing(raw: rawFacing, isLeft: isLeft, now: CACurrentMediaTime())
 
         return HandState(
             isTracked: true,
