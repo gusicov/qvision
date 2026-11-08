@@ -1,0 +1,8 @@
+# generated on CI by XcodeGen
+*.xcodeproj/
+App/Info.plist
+build/
+DerivedData/
+dist/
+*.ipa
+.DS_Store

@@ -1,0 +1,85 @@
+name: Build visionOS app
+
+# Builds an UNSIGNED .ipa on a free GitHub-hosted macOS runner.
+# Signing (free Apple ID) + install happen on the Windows PC with iloader.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest stable Xcode with the visionOS SDK
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i xros || { echo "::error::No visionOS (xros) SDK on this runner"; exit 1; }
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned, device)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project QVision.xcodeproj \
+            -scheme QVision \
+            -configuration Release \
+            -destination 'generic/platform=visionOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build.log
+
+      - name: Package .ipa
+        run: |
+          APP=$(find build/Build/Products -maxdepth 2 -name 'QVision.app' -path '*xros*' | head -1)
+          test -n "$APP" || { echo "::error::QVision.app not found"; exit 1; }
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          /usr/libexec/PlistBuddy -c 'Print' out/Payload/QVision.app/Info.plist | head -40
+          (cd out && zip -qry "QVision-${GITHUB_SHA::7}.ipa" Payload)
+          ls -lh out/*.ipa
+          echo "### ✅ Built QVision-${GITHUB_SHA::7}.ipa" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QVision-ipa
+          path: out/*.ipa
+          retention-days: 14
+
+      - name: Collect compiler errors
+        if: failure()
+        run: |
+          touch build.log
+          grep -E "(error|fatal error):" build.log | sort -u > errors.txt || true
+          {
+            echo "### ❌ Build errors"
+            echo '```'
+            head -60 errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: |
+            build.log
+            errors.txt
+          retention-days: 7

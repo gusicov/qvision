@@ -1,0 +1,45 @@
+# XcodeGen spec — the .xcodeproj is generated on the macOS CI runner,
+# so nothing Xcode-specific has to be edited by hand on Windows.
+name: QVision
+options:
+  bundleIdPrefix: com.qvision
+  deploymentTarget:
+    visionOS: "2.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  QVision:
+    type: application
+    platform: visionOS
+    sources:
+      - path: App/Sources
+      - path: App/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_NAME: QVision
+        PRODUCT_BUNDLE_IDENTIFIER: com.qvision.app
+        TARGETED_DEVICE_FAMILY: "7"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: NO
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: QVision
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # Lets the app's Documents folder show up in the Files app on the
+        # headset ("On My Apple Vision Pro › QVision").
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIApplicationSceneManifest:
+          UIApplicationPreferredDefaultSceneSessionRole: UIWindowSceneSessionRoleApplication
+          UIApplicationSupportsMultipleScenes: true
+          UISceneConfigurations: {}
+    scheme: {}
