@@ -33,6 +33,11 @@ A private, native visionOS app (SwiftUI + RealityKit + ARKit) for viewing 3D mod
 - **2K textures** (4K at most), PBR (Base Color, Roughness, Metallic, Normal).
 - One `.usdz` per object or zone is better than one huge file.
 
+### Large models (100 MB+)
+- QVision is signed with **Increased Memory Limit** (iloader Vision Pro build, since v0.3), so large scenes have more memory available.
+- Import reads through iCloud correctly (it waits for the full download) and shows progress.
+- If a model still fails: reduce the textures (4K → 2K roughly halves memory), remove hidden/interior geometry, or split the model (structure, furniture, landscape) into several `.usdz` files and use **Layers**.
+
 ### Getting files onto the headset
 Put the `.usdz` on **iCloud Drive** from Windows (iCloud for Windows or icloud.com). On the headset, open the project, tap **Import models**, then **iCloud Drive** › your file.
 
