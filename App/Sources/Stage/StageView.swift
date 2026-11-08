@@ -2,8 +2,9 @@ import SwiftUI
 import RealityKit
 import simd
 
-/// Contents of the ImmersiveSpace: the stage, the fly indicator and the hand panel
-/// (the project panel next to the LEFT palm), plus direct-manipulation gestures on items.
+/// Contents of the ImmersiveSpace: the stage, the fly indicator, the palm button
+/// (left palm toward your face) that shows/hides the project panel, the project panel
+/// itself (floating in front of the user), plus direct-manipulation gestures on items.
 struct StageView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
@@ -13,12 +14,14 @@ struct StageView: View {
     @State private var gestureState = StageGestureState()
 
     private static let handPanelID = "handPanel"
+    private static let palmButtonID = "palmButton"
 
-    // Hand panel tuning (meters / seconds).
-    private static let panelRightOffset: Float = 0.17
-    private static let panelUpOffset: Float = 0.06
-    private static let panelFollowRate: Float = 14
-    private static let panelGracePeriod: Float = 0.8
+    // Tuning (meters / seconds).
+    private static let palmButtonLift: Float = 0.06      // off the palm, toward the face
+    private static let palmButtonGrace: Float = 0.35     // stays tappable briefly after the palm turns
+    private static let panelDistance: Float = 0.55       // in front of the head
+    private static let panelSideOffset: Float = 0.12     // slightly to the right ("next to you")
+    private static let panelDrop: Float = 0.12           // a bit below eye level
     private static let panelWidth: Float = 0.30
 
     var body: some View {
@@ -31,6 +34,12 @@ struct StageView: View {
                 panel.isEnabled = false
                 content.add(panel)
                 attachmentState.handPanel = panel
+            }
+            if let button = attachments.entity(for: Self.palmButtonID) {
+                button.components.set(BillboardComponent())
+                button.isEnabled = false
+                content.add(button)
+                attachmentState.palmButton = button
             }
 
             let frameModel = model
@@ -47,6 +56,10 @@ struct StageView: View {
             Attachment(id: Self.handPanelID) {
                 // ProjectPanelView applies its own glass background in the .hand context.
                 ProjectPanelView(context: .hand)
+                    .environment(model)
+            }
+            Attachment(id: Self.palmButtonID) {
+                PalmPanelButton()
                     .environment(model)
             }
         }
@@ -90,40 +103,36 @@ struct StageView: View {
 
     @MainActor
     private static func updateHandPanel(model: AppModel, state: StageAttachmentState, pose: simd_float4x4?, dt: Float) {
-        guard let panel = state.handPanel else { return }
         state.clock += dt
 
-        // Pinned: frozen where it is, always visible, no following.
-        if model.isHandPanelPinned {
-            if !state.hasPlacedPanel {
-                panel.setPosition(floatingPanelPosition(pose: pose), relativeTo: nil)
-                state.hasPlacedPanel = true
+        // 1. Palm button: visible while the LEFT palm faces the user (+ short grace to tap it).
+        if let button = state.palmButton {
+            let left = model.hands.left
+            if left.isTracked && left.palmFacingUser, let pose {
+                let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
+                var towardHead = head - left.palmCenter
+                let length = simd_length(towardHead)
+                towardHead = length > 0.001 ? towardHead / length : SIMD3<Float>(0, 1, 0)
+                button.setPosition(left.palmCenter + towardHead * palmButtonLift, relativeTo: nil)
+                if !button.isEnabled { button.isEnabled = true }
+                state.lastPalmSeen = state.clock
+            } else if button.isEnabled, state.clock - state.lastPalmSeen > palmButtonGrace {
+                button.isEnabled = false
             }
-            showPanel(panel, state: state)
-            state.lastPalmSeen = state.clock
-            return
         }
 
-        let left = model.hands.left
-        if left.isTracked && left.palmFacingUser {
-            let right = headRight(pose: pose)
-            let target = left.palmCenter
-                + right * panelRightOffset
-                + SIMD3<Float>(0, panelUpOffset, 0)
-
-            if !panel.isEnabled || !state.hasPlacedPanel {
-                // Appear in place (no fly-in from the last spot).
-                panel.setPosition(target, relativeTo: nil)
-                state.hasPlacedPanel = true
-            } else {
-                let current = panel.position(relativeTo: nil)
-                let t = 1 - exp(-dt * panelFollowRate)
-                panel.setPosition(current + (target - current) * t, relativeTo: nil)
+        // 2. Project panel: world-locked in front of the user while visible.
+        guard let panel = state.handPanel else { return }
+        if model.isProjectPanelVisible {
+            if !state.panelWasVisible {
+                // Just turned on: appear in front, slightly right and below eye level.
+                panel.setPosition(panelPositionInFront(pose: pose), relativeTo: nil)
+                state.panelWasVisible = true
             }
-            state.lastPalmSeen = state.clock
             showPanel(panel, state: state)
-        } else if panel.isEnabled, state.clock - state.lastPalmSeen > panelGracePeriod {
-            panel.isEnabled = false
+        } else {
+            state.panelWasVisible = false
+            if panel.isEnabled { panel.isEnabled = false }
         }
     }
 
@@ -150,14 +159,17 @@ struct StageView: View {
         return length > 0.001 ? right / length : SIMD3<Float>(1, 0, 0)
     }
 
-    /// Used only when the panel is pinned before it was ever shown: ~0.5 m in front of the head.
-    private static func floatingPanelPosition(pose: simd_float4x4?) -> SIMD3<Float> {
-        guard let pose else { return SIMD3<Float>(0, 1.3, -0.6) }
+    /// In front of the head, slightly to the right and below eye level ("next to you").
+    private static func panelPositionInFront(pose: simd_float4x4?) -> SIMD3<Float> {
+        guard let pose else { return SIMD3<Float>(0.12, 1.3, -0.55) }
         let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
         var forward = SIMD3<Float>(-pose.columns.2.x, 0, -pose.columns.2.z)
         let length = simd_length(forward)
         forward = length > 0.001 ? forward / length : SIMD3<Float>(0, 0, -1)
-        return head + forward * 0.5 + SIMD3<Float>(0, -0.15, 0)
+        return head
+            + forward * panelDistance
+            + headRight(pose: pose) * panelSideOffset
+            + SIMD3<Float>(0, -panelDrop, 0)
     }
 
     // MARK: - Gestures
@@ -304,7 +316,8 @@ struct StageView: View {
 /// Entities of the RealityView attachments and hand-panel state, read by the per-frame update.
 final class StageAttachmentState {
     var handPanel: Entity?
-    var hasPlacedPanel = false
+    var palmButton: Entity?
+    var panelWasVisible = false
     var panelScaled = false
     /// Accumulated frame time (s) and the last time the left palm faced the user.
     var clock: Float = 0
@@ -340,5 +353,26 @@ final class StageGestureState {
     func resetRotation() {
         rotateItemID = nil
         startOrientation = nil
+    }
+}
+
+// MARK: - Palm button
+
+/// Small round button shown on the left palm; toggles the project panel.
+private struct PalmPanelButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Button {
+            model.isProjectPanelVisible.toggle()
+        } label: {
+            Label(model.isProjectPanelVisible ? "Hide panel" : "Panel",
+                  systemImage: model.isProjectPanelVisible ? "xmark" : "slider.horizontal.3")
+                .font(.headline)
+                .padding(.horizontal, 6)
+        }
+        .buttonStyle(.borderedProminent)
+        .buttonBorderShape(.capsule)
+        .glassBackgroundEffect(in: Capsule())
     }
 }

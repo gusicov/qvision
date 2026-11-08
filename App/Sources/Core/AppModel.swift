@@ -124,8 +124,9 @@ final class AppModel {
         didSet { fly.speed = min(max(flySpeed, 0.25), 4) }
     }
 
-    /// The hand panel stays floating where it is instead of following the left hand.
-    var isHandPanelPinned: Bool = false
+    /// The project panel floating in front of the user. Toggled by the palm button
+    /// (left palm toward your face) and the panel's close button.
+    var isProjectPanelVisible: Bool = false
 
     /// Maintained by the window roots (onAppear / onDisappear).
     var isLayersWindowOpen: Bool = false
@@ -216,7 +217,8 @@ final class AppModel {
         }
         if currentProject?.id != id {
             mainWindowHandedOffProjectID = nil
-            isHandPanelPinned = false
+            // Show the panel in front of the user when a project opens.
+            isProjectPanelVisible = true
         }
         currentProject = project
         interactionMode = .edit
@@ -255,7 +257,7 @@ final class AppModel {
         selectedPartID = nil
         inspection = nil
         importProgress = nil
-        isHandPanelPinned = false
+        isProjectPanelVisible = false
         isImportPickerRequested = false
         mainWindowHandedOffProjectID = nil
         stage.clear()

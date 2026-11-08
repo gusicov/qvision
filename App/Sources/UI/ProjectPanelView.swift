@@ -94,15 +94,15 @@ struct ProjectPanelView: View {
 
             if isHand {
                 Button {
-                    model.isHandPanelPinned.toggle()
+                    model.isProjectPanelVisible = false
                 } label: {
-                    Image(systemName: model.isHandPanelPinned ? "pin.fill" : "pin")
+                    Image(systemName: "xmark")
                         .font(.title3)
                         .frame(width: 44, height: 44)
                 }
                 .buttonBorderShape(.circle)
-                .accessibilityLabel(model.isHandPanelPinned ? "Unpin panel" : "Pin panel")
-                .help(model.isHandPanelPinned ? "Unpin: follow the left hand again" : "Pin: leave the panel floating here")
+                .accessibilityLabel("Hide panel")
+                .help("Hide the panel. Turn your left palm toward you and tap the palm button to bring it back.")
             }
         }
         .padding(.horizontal, isHand ? 20 : 24)
@@ -112,9 +112,6 @@ struct ProjectPanelView: View {
     private var objectCountText: String {
         let count = model.currentProject?.items.count ?? 0
         let objects = count == 1 ? "1 object" : "\(count) objects"
-        if isHand && model.isHandPanelPinned {
-            return objects + " · Pinned"
-        }
         return objects
     }
 
