@@ -10,8 +10,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "2"
 
 targets:
   QVision:
@@ -36,6 +36,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         # Lets the app's Documents folder show up in the Files app on the
         # headset ("On My Apple Vision Pro › QVision").
+        NSHandsTrackingUsageDescription: QVision uses hand tracking for fly mode (clench both fists to move) and for the palm Layers menu.
+        NSWorldSensingUsageDescription: QVision uses world tracking to place models in front of you.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:
