@@ -20,6 +20,10 @@ targets:
     sources:
       - path: App/Sources
       - path: App/Assets.xcassets
+      - path: App/Resources
+        buildPhase: resources
+        excludes:
+          - "**/.keep"
     settings:
       base:
         PRODUCT_NAME: QVision

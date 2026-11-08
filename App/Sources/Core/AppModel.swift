@@ -12,6 +12,8 @@ final class AppModel {
     static let stageSpaceID = "stage"
     static let layersWindowID = "layers"
     static let inspectorWindowID = "inspector"
+    /// The project panel: a real visionOS window (system move bar), opened from the palm button.
+    static let panelWindowID = "panel"
 
     static let supportedTypes: [UTType] = {
         var types: [UTType] = [.usdz, .usd, .realityFile]
@@ -124,8 +126,8 @@ final class AppModel {
         didSet { fly.speed = min(max(flySpeed, 0.25), 4) }
     }
 
-    /// The project panel floating in front of the user. Toggled by the palm button
-    /// (left palm toward your face) and the panel's close button.
+    /// The project panel window is open. Maintained by ProjectPanelWindowView
+    /// (onAppear / onDisappear); the palm button opens/dismisses that window.
     var isProjectPanelVisible: Bool = false
 
     /// Maintained by the window roots (onAppear / onDisappear).
@@ -217,8 +219,6 @@ final class AppModel {
         }
         if currentProject?.id != id {
             mainWindowHandedOffProjectID = nil
-            // Show the panel in front of the user when a project opens.
-            isProjectPanelVisible = true
         }
         currentProject = project
         interactionMode = .edit

@@ -3,8 +3,8 @@ import RealityKit
 import simd
 
 /// Contents of the ImmersiveSpace: the stage, the fly indicator, the palm button
-/// (left palm toward your face) that shows/hides the project panel, the project panel
-/// itself (floating in front of the user), plus direct-manipulation gestures on items.
+/// (left palm toward your face) that opens/closes the project panel WINDOW (a real
+/// visionOS window with the system move bar), plus direct-manipulation gestures on items.
 struct StageView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
@@ -13,28 +13,17 @@ struct StageView: View {
     @State private var attachmentState = StageAttachmentState()
     @State private var gestureState = StageGestureState()
 
-    private static let handPanelID = "handPanel"
     private static let palmButtonID = "palmButton"
 
     // Tuning (meters / seconds).
     private static let palmButtonLift: Float = 0.06      // off the palm, toward the face
     private static let palmButtonGrace: Float = 0.35     // stays tappable briefly after the palm turns
-    private static let panelDistance: Float = 0.55       // in front of the head
-    private static let panelSideOffset: Float = 0.12     // slightly to the right ("next to you")
-    private static let panelDrop: Float = 0.12           // a bit below eye level
-    private static let panelWidth: Float = 0.30
 
     var body: some View {
         RealityView { content, attachments in
             content.add(model.stage.root)
             content.add(model.fly.indicator)
 
-            if let panel = attachments.entity(for: Self.handPanelID) {
-                panel.components.set(BillboardComponent())
-                panel.isEnabled = false
-                content.add(panel)
-                attachmentState.handPanel = panel
-            }
             if let button = attachments.entity(for: Self.palmButtonID) {
                 button.components.set(BillboardComponent())
                 button.isEnabled = false
@@ -53,11 +42,6 @@ struct StageView: View {
         } update: { _, _ in
             // Everything dynamic is driven per frame by the SceneEvents.Update subscription.
         } attachments: {
-            Attachment(id: Self.handPanelID) {
-                // ProjectPanelView applies its own glass background in the .hand context.
-                ProjectPanelView(context: .hand)
-                    .environment(model)
-            }
             Attachment(id: Self.palmButtonID) {
                 PalmPanelButton()
                     .environment(model)
@@ -121,34 +105,6 @@ struct StageView: View {
             }
         }
 
-        // 2. Project panel: world-locked in front of the user while visible.
-        guard let panel = state.handPanel else { return }
-        if model.isProjectPanelVisible {
-            if !state.panelWasVisible {
-                // Just turned on: appear in front, slightly right and below eye level.
-                panel.setPosition(panelPositionInFront(pose: pose), relativeTo: nil)
-                state.panelWasVisible = true
-            }
-            showPanel(panel, state: state)
-        } else {
-            state.panelWasVisible = false
-            if panel.isEnabled { panel.isEnabled = false }
-        }
-    }
-
-    /// Shows the panel and, the first time its size is known, scales it to ~0.30 m wide.
-    @MainActor
-    private static func showPanel(_ panel: Entity, state: StageAttachmentState) {
-        if !panel.isEnabled {
-            panel.isEnabled = true
-        }
-        guard !state.panelScaled else { return }
-        // Local bounds (the entity's own scale isn't applied).
-        let bounds = panel.visualBounds(relativeTo: panel)
-        let width = bounds.extents.x
-        guard !bounds.isEmpty, width.isFinite, width > 0.01 else { return }
-        panel.scale = SIMD3<Float>(repeating: panelWidth / width)
-        state.panelScaled = true
     }
 
     /// Head right vector flattened to XZ (column 0 of the device pose).
@@ -157,19 +113,6 @@ struct StageView: View {
         let right = SIMD3<Float>(pose.columns.0.x, 0, pose.columns.0.z)
         let length = simd_length(right)
         return length > 0.001 ? right / length : SIMD3<Float>(1, 0, 0)
-    }
-
-    /// In front of the head, slightly to the right and below eye level ("next to you").
-    private static func panelPositionInFront(pose: simd_float4x4?) -> SIMD3<Float> {
-        guard let pose else { return SIMD3<Float>(0.12, 1.3, -0.55) }
-        let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
-        var forward = SIMD3<Float>(-pose.columns.2.x, 0, -pose.columns.2.z)
-        let length = simd_length(forward)
-        forward = length > 0.001 ? forward / length : SIMD3<Float>(0, 0, -1)
-        return head
-            + forward * panelDistance
-            + headRight(pose: pose) * panelSideOffset
-            + SIMD3<Float>(0, -panelDrop, 0)
     }
 
     // MARK: - Gestures
@@ -315,10 +258,7 @@ struct StageView: View {
 
 /// Entities of the RealityView attachments and hand-panel state, read by the per-frame update.
 final class StageAttachmentState {
-    var handPanel: Entity?
     var palmButton: Entity?
-    var panelWasVisible = false
-    var panelScaled = false
     /// Accumulated frame time (s) and the last time the left palm faced the user.
     var clock: Float = 0
     var lastPalmSeen: Float = 0
@@ -361,10 +301,16 @@ final class StageGestureState {
 /// Small round button shown on the left palm; toggles the project panel.
 private struct PalmPanelButton: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
         Button {
-            model.isProjectPanelVisible.toggle()
+            if model.isProjectPanelVisible {
+                dismissWindow(id: AppModel.panelWindowID)
+            } else {
+                openWindow(id: AppModel.panelWindowID)
+            }
         } label: {
             Label(model.isProjectPanelVisible ? "Hide panel" : "Panel",
                   systemImage: model.isProjectPanelVisible ? "xmark" : "slider.horizontal.3")

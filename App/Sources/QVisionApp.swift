@@ -18,7 +18,18 @@ struct QVisionApp: App {
         }
         .defaultSize(width: 640, height: 780)
 
-        // Movable Layers window (system window bar), opened from the hand panel.
+        // Project panel: a real window (system move bar underneath), opened/closed from the
+        // palm button. Placed as a utility panel: close to the user, slightly below eye level.
+        WindowGroup(id: AppModel.panelWindowID) {
+            ProjectPanelWindowView()
+                .environment(model)
+        }
+        .defaultSize(width: 540, height: 820)
+        .defaultWindowPlacement { _, _ in
+            WindowPlacement(.utilityPanel)
+        }
+
+        // Movable Layers window (system window bar), opened from the panel.
         WindowGroup(id: AppModel.layersWindowID) {
             LayersWindowView()
                 .environment(model)

@@ -653,12 +653,18 @@ struct ProjectPanelView: View {
         }
         let appModel = model
         let dismissSpace = dismissImmersiveSpace
+        let panelOpen = model.isProjectPanelVisible
+        let closeWindow = dismissWindow
         Task { @MainActor in
             if needsDismiss {
                 await dismissSpace()
                 appModel.stageState = .closed
             }
             isLeaving = false
+            // The panel window is where Leave was tapped; close it last.
+            if panelOpen {
+                closeWindow(id: AppModel.panelWindowID)
+            }
         }
     }
 

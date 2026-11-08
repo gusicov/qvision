@@ -14,6 +14,7 @@ struct RootView: View {
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\.openWindow) private var openWindow
 
     /// True while a stage open/dismiss sequence is running (hides the "stage closed" banner).
     @State private var isSyncingStage = false
@@ -110,6 +111,9 @@ struct RootView: View {
               model.mainWindowHandedOffProjectID != projectID,
               !isPresentingImporter else { return }
         model.mainWindowHandedOffProjectID = projectID
+        if !model.isProjectPanelVisible {
+            openWindow(id: AppModel.panelWindowID)
+        }
         dismissWindow(id: AppModel.mainWindowID)
     }
 
