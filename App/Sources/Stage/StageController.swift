@@ -54,6 +54,22 @@ enum StageLoadError: LocalizedError {
     private weak var shownEnvironment: Entity?
     private weak var activeImageBasedLight: Entity?
 
+    // v0.7 L4: sky dome + far ground follow the head (translation only).
+    /// Sky / far ground of each built environment with their AUTHORED scale, captured the first
+    /// time the environment is shown (before it is ever rescaled). Environments are kept for
+    /// the controller's lifetime (`environments`), so their identifiers stay valid.
+    private var followPartsCache: [ObjectIdentifier: EnvironmentFollowParts] = [:]
+    /// Last head position (world space) seen by `updateFrame(devicePose:)`.
+    private var lastHeadWorld: SIMD3<Float>?
+
+    // v0.7 L2: import units.
+    /// Set by every fresh `addItem`: nil when nothing was changed or flagged, else a one-line note
+    /// for the user, e.g. "Detected centimetres → scaled ×0.01 (now 12.4 × 8.1 × 7.9 m)".
+    private(set) var lastImportUnitNote: String?
+    /// Unit factor applied by the last fresh `addItem` (1 = file units taken as meters).
+    /// The caller persists it as `ProjectItem.unitScale` so a reload shows the same size.
+    private(set) var lastImportUnitScale: Float = 1
+
     private static let selectionName = "selection"
     private static let minCollisionSize: Float = 0.02
     private static let minPartCollisionSize: Float = 0.01
@@ -63,6 +79,26 @@ enum StageLoadError: LocalizedError {
     private static let placementSpread: Float = 0.7         // real-world meters
     private static let tabletopHeight: Float = 0.75
     private static let maxWalkNodes = 20_000
+
+    // Import units (L2). Thresholds are the max native extent, in file units read as meters.
+    private static let centimetreThreshold: Float = 2_000
+    private static let millimetreThreshold: Float = 200_000
+    private static let tinyModelThreshold: Float = 0.05
+    private static let minUnitScale: Float = 0.00001
+    private static let maxUnitScale: Float = 100_000
+
+    // Sky follow (L4), world meters.
+    private static let minSkyRadius: Float = 450
+    /// Upper bound of the adaptive sky radius. RealityKit doesn't document a far plane for
+    /// immersive spaces; 5 km stays well inside any sensible one. Because the dome is always
+    /// centred on the head, it can only clip if this value itself is beyond the far plane:
+    /// lower it if the sky ever disappears on device.
+    private static let maxSkyRadius: Float = 5_000
+    /// Dome radius >= this x the content's max extent.
+    private static let skyExtentFactor: Float = 1.5
+    /// ...and >= this x the distance from the head to the farthest content corner, so content
+    /// stays inside the dome even after flying far away from it.
+    private static let skyDistanceFactor: Float = 1.15
 
     init() {
         root = Entity()
@@ -124,6 +160,8 @@ enum StageLoadError: LocalizedError {
         contentRoot.isEnabled = true
         lastPlacement = nil
         lastUserPosition = nil
+        lastImportUnitNote = nil
+        lastImportUnitScale = 1
     }
 
     // MARK: - Items
@@ -132,7 +170,7 @@ enum StageLoadError: LocalizedError {
     func addItem(_ item: ProjectItem, assetURL: URL?, freshPlacement: Bool, placement: SIMD3<Float>) async throws -> Transform {
         let generation = contentGeneration
 
-        // 1. Content entity (native size, never rescaled).
+        // 1. Content entity (native size; only the import-unit factor (L2) ever scales it).
         let content: Entity
         if item.primitive != nil {
             content = Self.makeCube()
@@ -156,31 +194,40 @@ enum StageLoadError: LocalizedError {
             let pivot = SIMD3<Float>(initial.center.x, initial.min.y, initial.center.z)
             content.position = content.position - pivot
         }
-        let bounds = content.visualBounds(relativeTo: itemRoot)
-        let hasBounds = !bounds.isEmpty && Self.isFinite(bounds.extents)
+        // Native bounds (file units read as meters), bottom-centre at the root origin.
+        let nativeBox = content.visualBounds(relativeTo: itemRoot)
+        let nativeBounds: BoundingBox? = (!nativeBox.isEmpty && Self.isFinite(nativeBox.extents)) ? nativeBox : nil
+        let baseContentPosition = content.position
+        let baseContentScale = content.scale
+
+        // 2b. Import units (L2). The unit factor scales the content child about the root origin
+        //     (the bottom-centre), so it never shows up in the persisted item transform.
+        var unitScale = Self.sanitizedUnitScale(item.unitScale ?? 1)
+        if freshPlacement {
+            var note: String?
+            if item.unitScale == nil, let native = nativeBounds {
+                let detection = Self.detectUnits(nativeExtents: native.extents)
+                unitScale = detection.factor
+                note = detection.note
+            }
+            lastImportUnitScale = unitScale
+            lastImportUnitNote = note
+        }
+        Self.applyUnitScale(unitScale, to: content, basePosition: baseContentPosition, baseScale: baseContentScale)
+
+        let scaledBounds = nativeBounds.map { Self.scaleBounds($0, by: unitScale) }
 
         if freshPlacement {
             itemRoot.transform = .identity
             itemRoot.position = freshPosition(placement: placement,
-                                              footprint: hasBounds ? bounds.extents : SIMD3<Float>(repeating: 0.1))
+                                              footprint: scaledBounds?.extents ?? SIMD3<Float>(repeating: 0.1))
         } else {
             itemRoot.transform = item.transform.transform
         }
 
         // 3. Interaction: one tight bounding box in root space. Collision, InputTarget and
         //    HoverEffect are set (or not) by `refreshTargeting` below, per interaction mode.
-        let shape: ShapeResource
-        if hasBounds {
-            let size = SIMD3<Float>(
-                Swift.max(bounds.extents.x, Self.minCollisionSize),
-                Swift.max(bounds.extents.y, Self.minCollisionSize),
-                Swift.max(bounds.extents.z, Self.minCollisionSize)
-            )
-            shape = ShapeResource.generateBox(size: size).offsetBy(translation: bounds.center)
-        } else {
-            shape = ShapeResource.generateBox(size: SIMD3<Float>(repeating: 0.1))
-        }
-        let rootCollision = CollisionComponent(shapes: [shape])
+        let rootCollision = Self.makeRootCollision(bounds: scaledBounds)
         itemRoot.components.set(ItemComponent(id: item.id))
         Self.prepareContent(content)
         if let ibl = activeImageBasedLight {
@@ -189,7 +236,11 @@ enum StageLoadError: LocalizedError {
 
         let record = ItemRecord(id: item.id, name: item.name, root: itemRoot, content: content,
                                 assetURL: item.primitive == nil ? assetURL : nil,
-                                rootCollision: rootCollision)
+                                rootCollision: rootCollision,
+                                nativeBounds: nativeBounds,
+                                baseContentPosition: baseContentPosition,
+                                baseContentScale: baseContentScale,
+                                unitScale: unitScale)
 
         // 4. Hidden internal parts (fresh and restored items alike).
         for path in item.hiddenParts {
@@ -230,6 +281,123 @@ enum StageLoadError: LocalizedError {
         if selectedID == id {
             refreshSelectionIndicator()
         }
+    }
+
+    // MARK: - Import units (L2)
+
+    /// Rescales the item to `factor` x its native file size (1 = m, 0.01 = cm, 0.001 = mm,
+    /// 0.0254 = in, 0.3048 = ft). The factor lives on the content child, so the item transform
+    /// (and any user scale on it) is kept; the bottom height and the XZ position stay put.
+    /// Returns the item transform, which only changes when the item is tilted (X/Z rotation)
+    /// and its root had to move to keep the bottom where it was.
+    @discardableResult
+    func setItemUnitScale(_ id: UUID, _ factor: Float) -> Transform? {
+        guard let record = records[id] else { return nil }
+        let f = Self.sanitizedUnitScale(factor)
+        guard f != record.unitScale else { return record.root.transform }
+
+        let bottomBefore = contentBounds(record)?.min.y
+        record.unitScale = f
+        Self.applyUnitScale(f, to: record.content,
+                            basePosition: record.baseContentPosition, baseScale: record.baseContentScale)
+        // Scaling about the bottom-centre keeps the bottom at the root origin; only a tilted
+        // root (never produced by the gestures) needs a correction.
+        if let before = bottomBefore, let after = contentBounds(record)?.min.y {
+            let shift = before - after
+            if shift.isFinite, abs(shift) > 0.0001 {
+                record.root.position.y += shift
+            }
+        }
+
+        record.rootCollision = Self.makeRootCollision(bounds: record.scaledBounds)
+        record.bottomCache = nil
+        record.inspectionCache = nil
+        refreshTargeting(record)
+        if selectedID == id {
+            refreshSelectionIndicator()
+        }
+        return record.root.transform
+    }
+
+    /// Unit factor currently applied to the item (nil if the item isn't on the stage).
+    func unitScale(of id: UUID) -> Float? {
+        records[id]?.unitScale
+    }
+
+    /// Native size of the item's file (unit factor 1, no item / scene scale), W x H x D in file units.
+    func nativeSize(of id: UUID) -> SIMD3<Float>? {
+        records[id]?.nativeBounds?.extents
+    }
+
+    private static func sanitizedUnitScale(_ factor: Float) -> Float {
+        guard factor.isFinite, factor > 0 else { return 1 }
+        return Swift.min(Swift.max(factor, minUnitScale), maxUnitScale)
+    }
+
+    /// content.transform = S(f) * base: position and scale both multiplied by f (uniform f
+    /// commutes with the content's own rotation), i.e. a uniform scale about the root origin.
+    private static func applyUnitScale(_ f: Float, to content: Entity,
+                                       basePosition: SIMD3<Float>, baseScale: SIMD3<Float>) {
+        content.position = basePosition * f
+        content.scale = baseScale * f
+    }
+
+    private static func scaleBounds(_ b: BoundingBox, by f: Float) -> BoundingBox {
+        BoundingBox(min: b.min * f, max: b.max * f)
+    }
+
+    /// L2 detection from the native bounds (file units read as meters).
+    private static func detectUnits(nativeExtents e: SIMD3<Float>) -> (factor: Float, note: String?) {
+        let maxExtent = Swift.max(e.x, Swift.max(e.y, e.z))
+        guard maxExtent.isFinite else { return (1, nil) }
+        if maxExtent > millimetreThreshold {
+            let f: Float = 0.001
+            return (f, "Detected millimetres → scaled ×0.001 (now \(sizeText(e * f)))")
+        }
+        if maxExtent > centimetreThreshold {
+            let f: Float = 0.01
+            return (f, "Detected centimetres → scaled ×0.01 (now \(sizeText(e * f)))")
+        }
+        if maxExtent > 0, maxExtent < tinyModelThreshold {
+            return (1, "Very small model (\(sizeText(e))) → kept at file size; use Units if it should be larger")
+        }
+        return (1, nil)
+    }
+
+    /// "W × D × H m" (x, z, y).
+    private static func sizeText(_ e: SIMD3<Float>) -> String {
+        "\(lengthText(e.x)) × \(lengthText(e.z)) × \(lengthText(e.y)) m"
+    }
+
+    private static func lengthText(_ v: Float) -> String {
+        let a = abs(v)
+        let format: String
+        if a >= 1_000 {
+            format = "%.0f"
+        } else if a >= 1 {
+            format = "%.1f"
+        } else if a >= 0.01 {
+            format = "%.2f"
+        } else {
+            format = "%.3f"
+        }
+        return String(format: format, Double(v))
+    }
+
+    /// Tight root-space box collider (or a 10 cm fallback when the model has no bounds).
+    private static func makeRootCollision(bounds: BoundingBox?) -> CollisionComponent {
+        let shape: ShapeResource
+        if let bounds {
+            let size = SIMD3<Float>(
+                Swift.max(bounds.extents.x, minCollisionSize),
+                Swift.max(bounds.extents.y, minCollisionSize),
+                Swift.max(bounds.extents.z, minCollisionSize)
+            )
+            shape = ShapeResource.generateBox(size: size).offsetBy(translation: bounds.center)
+        } else {
+            shape = ShapeResource.generateBox(size: SIMD3<Float>(repeating: 0.1))
+        }
+        return CollisionComponent(shapes: [shape])
     }
 
     func apply(layers: [Layer], items: [ProjectItem]) {
@@ -753,6 +921,88 @@ enum StageLoadError: LocalizedError {
                 record.root.components.remove(ImageBasedLightReceiverComponent.self)
             }
         }
+
+        // Place the newly shown sky around the head right away (not one frame late).
+        updateEnvironmentFollow()
+    }
+
+    // MARK: - Per-frame (L4: the sky never clips)
+
+    /// Called every frame by StageView after FlyController moved `worldRoot`.
+    /// `devicePose` is the head in world space (nil without world tracking).
+    func updateFrame(devicePose: simd_float4x4?) {
+        if let pose = devicePose {
+            let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
+            if Self.isFinite(head) {
+                lastHeadWorld = head
+            }
+        }
+        updateEnvironmentFollow()
+    }
+
+    /// Sky dome and far ground follow the head (translation only; their rotation stays with the
+    /// world so the painted sun keeps matching the directional light). The dome radius adapts to
+    /// the content: >= 1.5 x its max extent, >= 1.15 x the farthest content corner from the head,
+    /// at least 450 m, at most `maxSkyRadius`. The near floor is not touched (world-locked, y = 0).
+    private func updateEnvironmentFollow() {
+        guard let environment = shownEnvironment, environment.isEnabled else { return }
+        let key = ObjectIdentifier(environment)
+        let parts: EnvironmentFollowParts
+        if let cached = followPartsCache[key] {
+            parts = cached
+        } else {
+            guard let created = EnvironmentFollowParts(environment: environment, worldRoot: worldRoot) else { return }
+            followPartsCache[key] = created
+            parts = created
+        }
+
+        // Head in worldRoot space (worldRoot is translated + yawed by fly mode; no scale).
+        let headWorld = lastHeadWorld ?? SIMD3<Float>(0, 0, 0)
+        let head = worldRoot.convert(position: headWorld, from: nil)
+        guard Self.isFinite(head) else { return }
+
+        let radius = adaptiveSkyRadius(head: head)
+        let k = radius / Swift.max(parts.skyBaseRadius, 1)
+
+        if let sky = parts.sky {
+            let scale = parts.skyBaseScale * k
+            if sky.scale != scale { sky.scale = scale }
+            sky.setPosition(head, relativeTo: worldRoot)
+        }
+        if let ground = parts.farGround {
+            let scale = SIMD3<Float>(parts.groundBaseScale.x * k, parts.groundBaseScale.y, parts.groundBaseScale.z * k)
+            if ground.scale != scale { ground.scale = scale }
+            ground.setPosition(SIMD3<Float>(head.x, parts.groundY, head.z), relativeTo: worldRoot)
+        }
+    }
+
+    /// Sky radius (world meters) from the visible content's bounds in worldRoot space.
+    /// Per item this is 8 corner transforms of a cached box, so it's cheap enough every frame
+    /// and also tracks items that are being dragged / scaled by the gestures.
+    private func adaptiveSkyRadius(head: SIMD3<Float>) -> Float {
+        var lo: SIMD3<Float>?
+        var hi: SIMD3<Float>?
+        if contentRoot.isEnabled {
+            let contentMatrix = contentRoot.transform.matrix
+            for (_, record) in records where record.root.isEnabled {
+                guard let local = record.scaledBounds else { continue }
+                let b = Self.transformBounds(local, by: contentMatrix * record.root.transform.matrix)
+                guard Self.isFinite(b.min), Self.isFinite(b.max) else { continue }
+                lo = lo.map { simd_min($0, b.min) } ?? b.min
+                hi = hi.map { simd_max($0, b.max) } ?? b.max
+            }
+        }
+        var radius = Self.minSkyRadius
+        if let lo, let hi {
+            let extents = hi - lo
+            let maxExtent = Swift.max(extents.x, Swift.max(extents.y, extents.z))
+            let farthestCorner = simd_max(simd_abs(head - lo), simd_abs(head - hi))
+            let farthest = simd_length(farthestCorner)
+            radius = Swift.max(radius, maxExtent * Self.skyExtentFactor)
+            radius = Swift.max(radius, farthest * Self.skyDistanceFactor)
+        }
+        guard radius.isFinite else { return Self.minSkyRadius }
+        return Swift.min(radius, Self.maxSkyRadius)
     }
 
     // MARK: - Placement
@@ -961,7 +1211,15 @@ enum StageLoadError: LocalizedError {
     let root: Entity
     let content: Entity
     let assetURL: URL?
-    let rootCollision: CollisionComponent
+    /// Root-space box collider; rebuilt when the unit factor changes.
+    var rootCollision: CollisionComponent
+    /// Content bounds in root space at unit factor 1 (bottom-centre at the origin). nil if empty.
+    let nativeBounds: BoundingBox?
+    /// Content transform after the pivot correction, at unit factor 1.
+    let baseContentPosition: SIMD3<Float>
+    let baseContentScale: SIMD3<Float>
+    /// Import-unit factor on the content child (1 = file units are meters).
+    var unitScale: Float
     var isLocked = false
     var hiddenParts: Set<String> = []
     /// Inspect-mode part colliders are in place (may be empty for a model without meshes).
@@ -970,13 +1228,57 @@ enum StageLoadError: LocalizedError {
     var inspectionCache: InspectionCache?
     var bottomCache: BottomCache?
 
-    init(id: UUID, name: String, root: Entity, content: Entity, assetURL: URL?, rootCollision: CollisionComponent) {
+    /// Content bounds in root space at the current unit factor.
+    var scaledBounds: BoundingBox? {
+        guard let b = nativeBounds else { return nil }
+        return BoundingBox(min: b.min * unitScale, max: b.max * unitScale)
+    }
+
+    init(id: UUID, name: String, root: Entity, content: Entity, assetURL: URL?,
+         rootCollision: CollisionComponent, nativeBounds: BoundingBox?,
+         baseContentPosition: SIMD3<Float>, baseContentScale: SIMD3<Float>, unitScale: Float) {
         self.id = id
         self.name = name
         self.root = root
         self.content = content
         self.assetURL = assetURL
         self.rootCollision = rootCollision
+        self.nativeBounds = nativeBounds
+        self.baseContentPosition = baseContentPosition
+        self.baseContentScale = baseContentScale
+        self.unitScale = unitScale
+    }
+}
+
+/// The parts of a shown environment that follow the head (L4), with their authored scale.
+@MainActor private struct EnvironmentFollowParts {
+    let sky: Entity?
+    let skyBaseScale: SIMD3<Float>
+    /// Radius of the sky mesh at `skyBaseScale` (450 m baked, 400 m procedural).
+    let skyBaseRadius: Float
+    let farGround: Entity?
+    let groundBaseScale: SIMD3<Float>
+    /// Far ground height in worldRoot space (stays put; only X/Z follow the head).
+    let groundY: Float
+
+    init?(environment: Entity, worldRoot: Entity) {
+        let sky = environment.findEntity(named: EnvironmentBuilder.skyDomeName)
+        let ground = environment.findEntity(named: EnvironmentBuilder.farGroundName)
+        guard sky != nil || ground != nil else { return nil }
+
+        self.sky = sky
+        skyBaseScale = sky?.scale ?? SIMD3<Float>(-1, 1, 1)
+        var radius = EnvironmentBuilder.skyRadius
+        if let bounds = sky?.components[ModelComponent.self]?.mesh.bounds, !bounds.isEmpty {
+            let e = bounds.extents
+            let r = 0.5 * Swift.max(e.x, Swift.max(e.y, e.z))
+            if r.isFinite, r > 1 { radius = r }
+        }
+        skyBaseRadius = radius
+
+        farGround = ground
+        groundBaseScale = ground?.scale ?? SIMD3<Float>(1, 1, 1)
+        groundY = ground?.position(relativeTo: worldRoot).y ?? -0.01
     }
 }
 

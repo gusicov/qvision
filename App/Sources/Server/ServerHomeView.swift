@@ -28,11 +28,11 @@ struct ServerHomeView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.horizontal, 36)
-                .padding(.top, 32)
-                .padding(.bottom, 20)
+                .padding(.top, 30)
+                .padding(.bottom, 16)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 24) {
                     statusArea
                     serversSection
                     settingsSection
@@ -82,28 +82,47 @@ struct ServerHomeView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 16) {
+        VStack(alignment: .leading, spacing: 22) {
+            BrandHeader {
+                Button {
+                    editorTarget = ServerEditorTarget(existing: nil)
+                } label: {
+                    Label("Add server", systemImage: "plus")
+                        .font(.headline)
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+
             VStack(alignment: .leading, spacing: 6) {
-                Text("Stream from a server")
-                    .font(.extraLargeTitle)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                Text("Unreal Engine on your PC or the office server, streamed with NVIDIA CloudXR.")
-                    .font(.title3)
+                HStack(spacing: 12) {
+                    Breadcrumb(components: ["Home", "Server"])
+                    Spacer(minLength: 8)
+                    phasePill
+                }
+                Text("Stream Unreal Engine from your PC or the office server with NVIDIA CloudXR.")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
 
-            Spacer(minLength: 16)
-
-            Button {
-                editorTarget = ServerEditorTarget(existing: nil)
-            } label: {
-                Label("Add server", systemImage: "plus")
-                    .font(.headline)
-                    .padding(.horizontal, 8)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+    /// Connection state at a glance, next to the breadcrumb.
+    @ViewBuilder
+    private var phasePill: some View {
+        switch server.phase {
+        case .idle:
+            InfoPill(text: "Not connected", systemImage: "circle")
+        case .connecting:
+            InfoPill(text: "Connecting", systemImage: "antenna.radiowaves.left.and.right")
+        case .connected:
+            InfoPill(text: "Streaming", systemImage: "dot.radiowaves.left.and.right", tint: .green)
+        case .disconnecting:
+            InfoPill(text: "Disconnecting", systemImage: "antenna.radiowaves.left.and.right")
+        case .failed:
+            InfoPill(text: "Failed", systemImage: "exclamationmark.triangle.fill", tint: .red)
         }
     }
 
@@ -210,17 +229,14 @@ struct ServerHomeView: View {
 
     private func statusCard<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         content()
-            .padding(20)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .qvCard()
     }
 
     // MARK: - Saved servers
 
     private var serversSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Servers")
-                .font(.title2.weight(.semibold))
+            SectionTitle("Servers", systemImage: "desktopcomputer")
 
             if server.servers.isEmpty {
                 VStack(alignment: .leading, spacing: 12) {
@@ -232,9 +248,7 @@ struct ServerHomeView: View {
                         Label("Add server", systemImage: "plus")
                     }
                 }
-                .padding(20)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .qvCard()
             } else {
                 ForEach(server.servers) { item in
                     serverRow(item)
@@ -281,12 +295,12 @@ struct ServerHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 16)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Brand.cardRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: Brand.cardRadius, style: .continuous)
                 .strokeBorder(isActive ? Color.accentColor : Color.clear, lineWidth: isLive ? 3 : 2)
         }
-        .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: Brand.cardRadius, style: .continuous))
         .hoverEffect()
         .contextMenu {
             Button {
@@ -307,8 +321,7 @@ struct ServerHomeView: View {
 
     private var settingsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Settings")
-                .font(.title2.weight(.semibold))
+            SectionTitle("Stream settings", systemImage: "slider.horizontal.3")
 
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -335,9 +348,7 @@ struct ServerHomeView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .padding(20)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .qvCard()
         }
     }
 
@@ -360,8 +371,7 @@ struct ServerHomeView: View {
             Label("How to test", systemImage: "questionmark.circle")
                 .font(.headline)
         }
-        .padding(20)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .qvCard()
     }
 
     private func howToStep(_ number: Int, _ text: String) -> some View {

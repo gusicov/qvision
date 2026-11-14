@@ -82,7 +82,10 @@ struct StageView: View {
     private static func updateFrame(model: AppModel, state: StageAttachmentState, deltaTime: Float) {
         let dt = Swift.min(Swift.max(deltaTime, 0), 0.1)
         model.fly.update(deltaTime: dt, worldRoot: model.stage.worldRoot)
-        updateHandPanel(model: model, state: state, pose: model.hands.devicePose(), dt: dt)
+        let pose = model.hands.devicePose()
+        // After fly mode moved worldRoot: sky dome + far ground re-centre on the head (L4).
+        model.stage.updateFrame(devicePose: pose)
+        updateHandPanel(model: model, state: state, pose: pose, dt: dt)
     }
 
     @MainActor
@@ -365,20 +368,42 @@ private struct PalmPanelButton: View {
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
-        Button {
-            if model.isProjectPanelVisible {
-                dismissWindow(id: AppModel.panelWindowID)
-            } else {
-                openWindow(id: AppModel.panelWindowID)
+        HStack(spacing: 8) {
+            // Undo / Redo right on the palm (L1).
+            Button {
+                model.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
             }
-        } label: {
-            Label(model.isProjectPanelVisible ? "Hide panel" : "Panel",
-                  systemImage: model.isProjectPanelVisible ? "xmark" : "slider.horizontal.3")
-                .font(.headline)
-                .padding(.horizontal, 6)
+            .disabled(!model.canUndo)
+            .accessibilityLabel("Undo")
+
+            Button {
+                if model.isProjectPanelVisible {
+                    // Tell AppModel this is a palm hide, not "user closed the last window" (L6).
+                    model.notePanelHideRequested()
+                    dismissWindow(id: AppModel.panelWindowID)
+                } else {
+                    openWindow(id: AppModel.panelWindowID)
+                }
+            } label: {
+                Label(model.isProjectPanelVisible ? "Hide panel" : "Panel",
+                      systemImage: model.isProjectPanelVisible ? "xmark" : "slider.horizontal.3")
+                    .font(.headline)
+                    .padding(.horizontal, 6)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Button {
+                model.redo()
+            } label: {
+                Image(systemName: "arrow.uturn.forward")
+            }
+            .disabled(!model.canRedo)
+            .accessibilityLabel("Redo")
         }
-        .buttonStyle(.borderedProminent)
         .buttonBorderShape(.capsule)
+        .padding(6)
         .glassBackgroundEffect(in: Capsule())
     }
 }

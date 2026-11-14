@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Home screen: "All Projects".
+/// Home › All Projects: branded header, "you are here" breadcrumb, project cards, empty state.
 struct ProjectsHomeView: View {
     @Environment(AppModel.self) private var model
 
@@ -14,20 +14,41 @@ struct ProjectsHomeView: View {
     @State private var isConfirmingDelete = false
     @State private var deleteTarget: Project?
 
-    private let columns = [GridItem(.adaptive(minimum: 240, maximum: 360), spacing: 24)]
+    private let columns = [GridItem(.adaptive(minimum: 220, maximum: 320), spacing: 20)]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
-                .padding(.horizontal, 36)
-                .padding(.top, 32)
-                .padding(.bottom, 20)
+            BrandHeader {
+                Button {
+                    startCreating()
+                } label: {
+                    Label("New Project", systemImage: "plus")
+                        .font(.headline)
+                        .padding(.horizontal, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(model.isTransitioning)
+            }
+            .padding(.horizontal, 36)
+            .padding(.top, 30)
+
+            HStack(spacing: 12) {
+                Breadcrumb(components: ["Home", "All Projects"])
+                Spacer(minLength: 8)
+                if !model.projects.isEmpty {
+                    InfoPill(text: projectCountText)
+                }
+            }
+            .padding(.horizontal, 36)
+            .padding(.top, 22)
+            .padding(.bottom, 16)
 
             if model.projects.isEmpty {
                 emptyState
             } else {
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 24) {
+                    LazyVGrid(columns: columns, spacing: 20) {
                         ForEach(model.projects) { project in
                             projectCard(project)
                         }
@@ -75,85 +96,103 @@ struct ProjectsHomeView: View {
         }
     }
 
-    // MARK: - Header
-
-    private var header: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 16) {
-            Text("All Projects")
-                .font(.extraLargeTitle)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-
-            Spacer(minLength: 16)
-
-            Button {
-                newProjectName = "Project \(model.projects.count + 1)"
-                isCreating = true
-            } label: {
-                Label("New Project", systemImage: "plus")
-                    .font(.headline)
-                    .padding(.horizontal, 8)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-        }
+    private var projectCountText: String {
+        model.projects.count == 1 ? "1 project" : "\(model.projects.count) projects"
     }
 
     // MARK: - Empty state
 
     private var emptyState: some View {
-        VStack {
-            Spacer()
-            ContentUnavailableView {
-                Label("No projects yet", systemImage: "square.stack.3d.up")
-            } description: {
-                Text("QVision places your 3D models (USDZ, USD, Reality, OBJ) in your room or in a fully immersive stage.")
-            } actions: {
-                Button("New Project") {
-                    newProjectName = "Project 1"
-                    isCreating = true
-                }
-                .buttonStyle(.borderedProminent)
+        VStack(spacing: 22) {
+            Spacer(minLength: 0)
+            BrandMark(size: 96)
+            VStack(spacing: 8) {
+                Text("Create your first project")
+                    .font(.title.weight(.semibold))
+                Text("A project holds your models, their layers and where you placed them. Open it to see everything at real size, in your room or fully immersive.")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
             }
-            Spacer()
+            Button {
+                startCreating()
+            } label: {
+                Label("New Project", systemImage: "plus")
+                    .font(.headline)
+                    .padding(.horizontal, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            HStack(spacing: 8) {
+                ForEach(["USDZ", "USD", "Reality", "OBJ"], id: \.self) { format in
+                    InfoPill(text: format)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Supported formats: USDZ, USD, Reality, OBJ")
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 36)
+        .padding(.bottom, 36)
     }
 
     // MARK: - Cards
 
     private func projectCard(_ project: Project) -> some View {
-        Button {
-            Task { await model.openProject(project.id) }
-        } label: {
-            ProjectCardContent(project: project)
+        let isOpening = model.openingProjectID == project.id
+
+        return ZStack(alignment: .topTrailing) {
+            Button {
+                model.requestOpenProject(project.id)
+            } label: {
+                ProjectCardContent(project: project, isOpening: isOpening)
+            }
+            .buttonStyle(.plain)
+            .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .hoverEffect()
+            .disabled(model.isTransitioning)
+            .accessibilityLabel("Open \(project.name)")
+            .contextMenu {
+                cardActions(project)
+            }
+
+            Menu {
+                cardActions(project)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 40, height: 40)
+            }
+            .buttonBorderShape(.circle)
+            .padding(20)
+            .accessibilityLabel("Actions for \(project.name)")
         }
-        .buttonStyle(.plain)
-        .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .hoverEffect()
-        .disabled(model.isLoading)
-        .contextMenu {
-            Button {
-                renameTargetID = project.id
-                renameText = project.name
-                isRenaming = true
-            } label: {
-                Label("Rename", systemImage: "pencil")
-            }
+    }
 
-            Button {
-                model.duplicateProject(project.id)
-            } label: {
-                Label("Duplicate", systemImage: "plus.square.on.square")
-            }
+    @ViewBuilder
+    private func cardActions(_ project: Project) -> some View {
+        Button {
+            renameTargetID = project.id
+            renameText = project.name
+            isRenaming = true
+        } label: {
+            Label("Rename", systemImage: "pencil")
+        }
 
-            Button(role: .destructive) {
-                deleteTarget = project
-                isConfirmingDelete = true
-            } label: {
-                Label("Delete", systemImage: "trash")
-            }
+        Button {
+            model.duplicateProject(project.id)
+        } label: {
+            Label("Duplicate", systemImage: "plus.square.on.square")
+        }
+
+        Button(role: .destructive) {
+            deleteTarget = project
+            isConfirmingDelete = true
+        } label: {
+            Label("Delete", systemImage: "trash")
         }
     }
 
@@ -164,15 +203,21 @@ struct ProjectsHomeView: View {
         return "Delete project?"
     }
 
+    private func startCreating() {
+        newProjectName = "Project \(model.projects.count + 1)"
+        isCreating = true
+    }
+
     private func createAndOpen() {
         let project = model.createProject(named: newProjectName)
-        Task { await model.openProject(project.id) }
+        model.requestOpenProject(project.id)
     }
 }
 
-/// Visual content of one project card.
+/// Visual content of one project card: monogram tile, name, date, counts.
 private struct ProjectCardContent: View {
     let project: Project
+    let isOpening: Bool
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
@@ -182,28 +227,49 @@ private struct ProjectCardContent: View {
     }()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Image(systemName: "square.stack.3d.up.fill")
-                .font(.system(size: 40, weight: .regular))
-                .foregroundStyle(.tint)
-                .padding(.bottom, 6)
+        VStack(alignment: .leading, spacing: 12) {
+            ProjectMonogram(project: project, height: 118)
+                .overlay(alignment: .bottomLeading) {
+                    Label(project.viewMode.title, systemImage: project.viewMode.systemImage)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.black.opacity(0.25), in: Capsule())
+                        .padding(10)
+                }
+                .overlay {
+                    if isOpening {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .fill(.black.opacity(0.35))
+                            ProgressView()
+                                .controlSize(.large)
+                        }
+                    }
+                }
 
-            Text(project.name)
-                .font(.title3.weight(.semibold))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(project.name)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(1)
+                    .multilineTextAlignment(.leading)
+                Text(isOpening ? "Opening…" : "Edited \(Self.relativeFormatter.localizedString(for: project.modifiedAt, relativeTo: Date()))")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
 
-            Text("Edited \(Self.relativeFormatter.localizedString(for: project.modifiedAt, relativeTo: Date()))")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-
-            Text(objectCountText)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 14) {
+                Label(objectCountText, systemImage: "cube")
+                Label(layerCountText, systemImage: "square.3.layers.3d")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, minHeight: 200, alignment: .topLeading)
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
@@ -211,5 +277,10 @@ private struct ProjectCardContent: View {
     private var objectCountText: String {
         let count = project.items.count
         return count == 1 ? "1 object" : "\(count) objects"
+    }
+
+    private var layerCountText: String {
+        let count = project.layers.count
+        return count == 1 ? "1 layer" : "\(count) layers"
     }
 }

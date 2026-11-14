@@ -2,25 +2,21 @@ import SwiftUI
 
 /// Root of the main window.
 ///
-/// - No project open: All Projects (ProjectsHomeView).
+/// - No project open: Home (Projects + Server tabs).
 /// - Project open: the project panel in window form. As soon as the stage is open and hand
-///   tracking runs, the main window closes (once per project open) and the panel lives on the
-///   left hand. If hand tracking never runs (denied / unsupported), the window stays.
+///   tracking runs, the panel window opens and the main window closes (once per project open).
+///   If hand tracking never runs (denied / unsupported), the main window stays as the panel.
 ///
-/// RootView also owns opening the stage ImmersiveSpace when a project opens, and presents the
-/// file picker for "Import models" (requested by the project panel in either context).
+/// The stage ImmersiveSpace is opened / closed by AppModel's serialized app flow (open / leave);
+/// RootView only presents the file picker for "Import models" (requested by the panel).
 struct RootView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
-    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openWindow) private var openWindow
 
-    /// True while a stage open/dismiss sequence is running (hides the "stage closed" banner).
-    @State private var isSyncingStage = false
     @State private var isPresentingImporter = false
 
-    /// Everything the main-window → hand-panel handoff depends on.
+    /// Everything the main-window → panel-window handoff depends on.
     private struct HandoffTrigger: Equatable {
         let projectID: UUID?
         let stageOpen: Bool
@@ -49,26 +45,19 @@ struct RootView: View {
             }
 
             // Project opening (the import progress shows inside the panel instead).
-            if model.isLoading && model.importProgress == nil {
+            if model.isLoading && model.importProgress == nil && model.currentProject != nil {
                 loadingOverlay
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            if showsStageClosedBanner {
-                stageClosedBanner
-            }
-        }
+        .installsSceneActions()
         .onAppear {
-            model.isMainWindowOpen = true
+            model.mainWindowDidAppear()
         }
         .onDisappear {
-            model.isMainWindowOpen = false
-        }
-        .onChange(of: model.currentProject?.id) { _, _ in
-            startStageSync()
+            model.mainWindowDidDisappear()
         }
         .onChange(of: handoffTrigger, initial: true) { _, trigger in
-            handOffToHandPanelIfReady(trigger)
+            handOffToPanelWindowIfReady(trigger)
         }
         .onChange(of: model.isImportPickerRequested, initial: true) { _, requested in
             guard requested else { return }
@@ -82,7 +71,7 @@ struct RootView: View {
         }
         .onChange(of: isPresentingImporter) { _, presenting in
             if !presenting {
-                returnToHandPanelAfterImport()
+                returnToPanelWindowAfterImport()
             }
         }
         .fileImporter(
@@ -97,7 +86,7 @@ struct RootView: View {
                 model.lastError = "Couldn't open the file picker: \(error.localizedDescription)"
             }
         }
-        // Inside a project, errors show inline in the project panel (which also works on the hand).
+        // Inside a project, errors show inline in the project panel.
         .alert("Something went wrong", isPresented: errorBinding) {
             Button("OK", role: .cancel) {
                 model.lastError = nil
@@ -107,9 +96,9 @@ struct RootView: View {
         }
     }
 
-    // MARK: - Main window → hand panel
+    // MARK: - Main window → panel window
 
-    private func handOffToHandPanelIfReady(_ trigger: HandoffTrigger) {
+    private func handOffToPanelWindowIfReady(_ trigger: HandoffTrigger) {
         guard let projectID = trigger.projectID,
               trigger.stageOpen,
               trigger.handsRunning,
@@ -119,12 +108,13 @@ struct RootView: View {
         if !model.isProjectPanelVisible {
             openWindow(id: AppModel.panelWindowID)
         }
+        model.noteMainWindowDismissRequested()
         dismissWindow(id: AppModel.mainWindowID)
     }
 
-    /// The main window was (re)opened to present the file picker for the hand panel. Once the
-    /// picker is gone, close the window again if the hand panel is usable.
-    private func returnToHandPanelAfterImport() {
+    /// The main window was (re)opened to present the file picker for the panel window. Once the
+    /// picker is gone, close the window again if the panel window is usable.
+    private func returnToPanelWindowAfterImport() {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !isPresentingImporter,
@@ -132,50 +122,11 @@ struct RootView: View {
                   model.stageState == .open,
                   model.hands.status == .running else { return }
             model.mainWindowHandedOffProjectID = model.currentProject?.id
-            dismissWindow(id: AppModel.mainWindowID)
-        }
-    }
-
-    // MARK: - Stage space lifetime
-
-    private func startStageSync() {
-        isSyncingStage = true
-        Task { @MainActor in
-            await syncStage()
-            isSyncingStage = false
-        }
-    }
-
-    /// Converges the ImmersiveSpace to "open iff a project is open". Loops so that a
-    /// project opened/closed while a transition was in flight is still honoured.
-    /// (Leave from the hand panel dismisses the space itself and marks `.transitioning`,
-    /// so this does nothing in that case.)
-    @MainActor
-    private func syncStage() async {
-        while true {
-            let wantsStage = model.currentProject != nil
-            switch (wantsStage, model.stageState) {
-            case (true, .closed):
-                model.stageState = .transitioning
-                let result = await openImmersiveSpace(id: AppModel.stageSpaceID)
-                switch result {
-                case .opened:
-                    model.stageState = .open
-                default:
-                    model.stageState = .closed
-                    model.lastError = "The 3D stage couldn't be opened. Use “Open Stage” to try again."
-                    return
-                }
-
-            case (false, .open):
-                model.stageState = .transitioning
-                await dismissImmersiveSpace()
-                model.stageState = .closed
-
-            default:
-                // Already in the desired state, or another sync is mid-transition.
-                return
+            if !model.isProjectPanelVisible {
+                openWindow(id: AppModel.panelWindowID)
             }
+            model.noteMainWindowDismissRequested()
+            dismissWindow(id: AppModel.mainWindowID)
         }
     }
 
@@ -190,32 +141,11 @@ struct RootView: View {
         )
     }
 
-    private var showsStageClosedBanner: Bool {
-        model.currentProject != nil && model.stageState == .closed && !isSyncingStage
-    }
-
-    private var stageClosedBanner: some View {
-        HStack(spacing: 16) {
-            Label("The 3D stage is closed.", systemImage: "cube.transparent")
-                .font(.callout)
-            Spacer(minLength: 8)
-            Button("Open Stage") {
-                startStageSync()
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 14)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        .padding(.horizontal, 24)
-        .padding(.bottom, 16)
-    }
-
     private var loadingOverlay: some View {
         VStack(spacing: 14) {
             ProgressView()
                 .controlSize(.large)
-            Text("Loading…")
+            Text("Opening \(model.currentProject?.name ?? "project")…")
                 .font(.headline)
         }
         .padding(32)

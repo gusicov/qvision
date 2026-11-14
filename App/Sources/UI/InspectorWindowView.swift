@@ -8,8 +8,23 @@ struct InspectorWindowView: View {
     var body: some View {
         NavigationStack {
             content
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if let project = model.currentProject {
+                        Breadcrumb(components: ["Home", project.name, "Inspector"])
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, 8)
+                    }
+                }
+                .toolbar {
+                    // Disabled (canUndo / canRedo are false) when no project is open.
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        UndoRedoButtons()
+                    }
+                }
                 .navigationTitle("Inspector")
         }
+        .installsSceneActions()
         .onAppear {
             model.isInspectorWindowOpen = true
         }

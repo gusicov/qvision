@@ -1,15 +1,16 @@
 import SwiftUI
 
-/// The project panel: every control for the open project.
+/// The project panel: every control for the open project (v0.7: compact).
 ///
-/// - `.hand`: lives next to the LEFT hand as a RealityView attachment (StageView places it).
-///   ~520 × 720 pt with its own glass background and a Pin button.
-/// - `.window`: shown in the main window when hand tracking isn't available. The window
-///   provides the glass.
+/// Layout:
+/// - Header: QVision mark, "Home › Project" (Home leaves the project), a one-line summary,
+///   Back / Forward (places) and Undo / Redo (edits).
+/// - Cards: Mode & view · Navigate (fly, speed, recenter) · Objects (import, units, list).
+/// - Advanced (collapsed by default, remembered): scene scale, table height, snapping, reset.
+/// - Footer: Layers · Inspector · Leave.
 ///
-/// Presentations (alerts, sheets, file pickers, menus) are avoided in the `.hand` context because
-/// they aren't reliable from immersive-space attachments: errors show inline, item actions expand
-/// inline, and "Import models" asks the main window to present the file picker.
+/// Shown in the panel window (`ProjectPanelWindowView`) and, without hand tracking, in the main
+/// window. Both are real windows, so menus are used. `.hand` keeps the old attachment framing.
 struct ProjectPanelView: View {
     enum Context { case hand, window }
 
@@ -18,22 +19,18 @@ struct ProjectPanelView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
-    /// Item whose inline action strip is expanded (hand context).
-    @State private var expandedItemID: UUID?
-    @State private var isLeaving = false
+    @AppStorage("qvision.panel.advancedExpanded") private var isAdvancedExpanded = false
 
     private static let quickScales: [Double] = [1, 5, 10, 25, 50, 100]
+    private static let quickFlySpeeds: [Float] = [1, 3, 10]
 
-    init(context: Context) {
+    init(context: Context = .window) {
         self.context = context
     }
 
-    private var isHand: Bool { context == .hand }
-
     var body: some View {
-        if isHand {
+        if context == .hand {
             panel
                 .frame(width: 520, height: 720)
                 .glassBackgroundEffect()
@@ -48,21 +45,21 @@ struct ProjectPanelView: View {
             header
             Divider()
 
-            if model.currentProject != nil {
+            if let project = model.currentProject {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: isHand ? 12 : 16) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if showsStageClosedBanner {
+                            stageClosedBanner
+                        }
                         if let error = model.lastError {
                             errorBanner(error)
                         }
-                        modeSection
-                        viewSection
-                        scaleSection
-                        placementSection
-                        navigateSection
-                        sceneSection
-                        objectsSection
+                        modeCard
+                        navigateCard
+                        objectsCard(project)
+                        advancedCard
                     }
-                    .padding(isHand ? 16 : 24)
+                    .padding(18)
                 }
             } else {
                 Spacer(minLength: 0)
@@ -77,55 +74,87 @@ struct ProjectPanelView: View {
         }
     }
 
-    // MARK: - 1. Header
+    // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.currentProject?.name ?? "QVision")
-                    .font(isHand ? .title3.weight(.semibold) : .title2.weight(.semibold))
-                    .lineLimit(1)
-                Text(objectCountText)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                BrandMark(size: 34)
+                Breadcrumb(components: ["Home", model.currentProject?.name ?? "Project"],
+                           prominent: true,
+                           onHome: model.isTransitioning ? nil : { model.requestLeave() })
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 10) {
+                Text(summaryText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-            }
-
-            Spacer(minLength: 8)
-
-            if isHand {
-                Button {
-                    model.isProjectPanelVisible = false
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.title3)
-                        .frame(width: 44, height: 44)
-                }
-                .buttonBorderShape(.circle)
-                .accessibilityLabel("Hide panel")
-                .help("Hide the panel. Turn your left palm toward you and tap the palm button to bring it back.")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Spacer(minLength: 8)
+                historyControls
             }
         }
-        .padding(.horizontal, isHand ? 20 : 24)
-        .padding(.vertical, isHand ? 14 : 18)
+        .padding(.horizontal, 20)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
     }
 
-    private var objectCountText: String {
-        let count = model.currentProject?.items.count ?? 0
-        let objects = count == 1 ? "1 object" : "\(count) objects"
-        return objects
+    private var summaryText: String {
+        guard let project = model.currentProject else { return "" }
+        let count = project.items.count
+        var parts = [count == 1 ? "1 object" : "\(count) objects", model.interactionMode.title]
+        if project.scenePercent < 100 {
+            parts.append("1:\(DisplayFormat.scaleDenominator(percent: project.scenePercent))")
+        }
+        return parts.joined(separator: " · ")
     }
 
-    // MARK: - 2. Mode
-
-    private var modeSection: some View {
-        PanelSection("Mode", systemImage: "hand.tap", compact: isHand) {
-            Picker("Mode", selection: modeBinding) {
-                ForEach(InteractionMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
+    /// Back / Forward (places) | Undo / Redo (edits).
+    private var historyControls: some View {
+        HStack(spacing: 2) {
+            ToolbarIconButton(title: "Back to the previous place", systemImage: "chevron.backward") {
+                model.goBack()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            .disabled(!model.canGoBack)
+
+            ToolbarIconButton(title: "Forward to the next place", systemImage: "chevron.forward") {
+                model.goForward()
+            }
+            .disabled(!model.canGoForward)
+
+            Divider()
+                .frame(height: 26)
+                .padding(.horizontal, 4)
+
+            ToolbarIconButton(title: "Undo", systemImage: "arrow.uturn.backward") {
+                model.undo()
+            }
+            .disabled(!model.canUndo)
+
+            ToolbarIconButton(title: "Redo", systemImage: "arrow.uturn.forward") {
+                model.redo()
+            }
+            .disabled(!model.canRedo)
+        }
+        .padding(.horizontal, 6)
+        .background(.thinMaterial, in: Capsule())
+    }
+
+    // MARK: - Mode & view
+
+    private var modeCard: some View {
+        PanelCard {
+            labeledRow("Mode") {
+                Picker("Mode", selection: modeBinding) {
+                    ForEach(InteractionMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
 
             Text(model.interactionMode.hint)
                 .font(.callout)
@@ -144,129 +173,65 @@ struct ProjectPanelView: View {
                     openWindow(id: AppModel.inspectorWindowID)
                 } label: {
                     Label("Open Inspector", systemImage: "info.circle")
-                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .frame(maxWidth: .infinity, minHeight: 40)
                 }
                 .buttonStyle(.bordered)
             }
-        }
-    }
 
-    // MARK: - 3. View
+            Divider().padding(.vertical, 2)
 
-    private var viewSection: some View {
-        PanelSection("View", systemImage: "eye", compact: isHand) {
-            Picker("View mode", selection: viewModeBinding) {
-                ForEach(ViewMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            if model.viewMode == .full {
-                Text("Environment")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-                Picker("Environment", selection: environmentBinding) {
-                    ForEach(EnvironmentPreset.allCases) { preset in
-                        Text(preset.title).tag(preset)
+            labeledRow("View") {
+                Picker("View", selection: viewModeBinding) {
+                    ForEach(ViewMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.systemImage).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
             }
-        }
-    }
 
-    // MARK: - 4. Scale
-
-    private var scaleSection: some View {
-        let percent = model.sceneScalePercent
-
-        return PanelSection("Scale", systemImage: "arrow.up.left.and.arrow.down.right", compact: isHand) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Scale 1:\(DisplayFormat.scaleDenominator(percent: percent))")
-                    .font(.title3.weight(.semibold).monospacedDigit())
-                Spacer(minLength: 8)
-                Text("\(Int(percent.rounded())) %")
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            Slider(value: scaleBinding, in: 1...100, step: 1)
-                .accessibilityLabel("Scene scale")
-                .accessibilityValue("\(Int(percent.rounded())) percent")
-
-            HStack(spacing: 6) {
-                ForEach(Self.quickScales, id: \.self) { value in
-                    let isCurrent = Int(percent.rounded()) == Int(value)
-                    Button {
-                        model.sceneScalePercent = value
-                    } label: {
-                        Text("\(Int(value))%")
-                            .font(.callout.monospacedDigit())
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
-                            .frame(maxWidth: .infinity, minHeight: 36)
+            if model.viewMode == .full {
+                labeledRow("Sky") {
+                    Picker("Environment", selection: environmentBinding) {
+                        ForEach(EnvironmentPreset.allCases) { preset in
+                            Text(preset.title).tag(preset)
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .tint(isCurrent ? Color.accentColor : nil)
-                    .accessibilityLabel("Scale \(Int(value)) percent")
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
                 }
             }
-
-            Toggle(isOn: tabletopBinding) {
-                Label("Table height", systemImage: "arrow.up.to.line")
-            }
-            .disabled(percent >= 100)
-            .frame(minHeight: 44)
-
-            Text(percent >= 100
-                 ? "100 % is real size. Scale the whole scene down to view it like a model."
-                 : "The whole scene shrinks in place. Table height lifts it to 75 cm.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    // MARK: - 5. Placement
-
-    private var placementSection: some View {
-        let selectedID = model.selectedItemID
-        let selectedLocked = selectedID.map { model.isItemLocked($0) } ?? false
-
-        return PanelSection("Placement", systemImage: "square.and.arrow.down.on.square", compact: isHand) {
-            Toggle(isOn: snapBinding) {
-                Label("Snap to floor", systemImage: "arrow.down.to.line")
-            }
-            .frame(minHeight: 44)
-
-            Button {
-                model.dropSelectedToFloor()
-            } label: {
-                Label("Drop selected to floor", systemImage: "arrow.down.circle")
-                    .frame(maxWidth: .infinity, minHeight: 44)
-            }
-            .buttonStyle(.bordered)
-            .disabled(selectedID == nil || selectedLocked)
+    private func labeledRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 48, alignment: .leading)
+            content()
         }
     }
 
-    // MARK: - 6. Navigate
+    // MARK: - Navigate
 
-    private var navigateSection: some View {
-        PanelSection("Navigate", systemImage: "move.3d", compact: isHand) {
-            Toggle(isOn: flyBinding) {
-                Label("Fly mode", systemImage: "airplane")
+    private var navigateCard: some View {
+        PanelCard {
+            HStack(spacing: 12) {
+                Toggle(isOn: flyBinding) {
+                    Label("Fly mode", systemImage: "airplane")
+                        .font(.headline)
+                }
+                .frame(minHeight: 44)
             }
-            .frame(minHeight: 44)
 
-            Text("Clench both fists, then push to move (farther = faster), twist to turn. Open a hand to stop.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if model.isFlyModeEnabled {
+                Text("Clench both fists, then push to move (farther = faster), twist to turn. Open a hand to stop.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if let warning = handTrackingWarning {
                 Label(warning, systemImage: "exclamationmark.triangle.fill")
@@ -275,37 +240,51 @@ struct ProjectPanelView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack {
-                Text("Fly speed")
-                Spacer(minLength: 8)
-                Text(flySpeedText)
-                    .font(.body.monospacedDigit())
+            HStack(spacing: 12) {
+                Text("Speed")
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
+                Slider(value: flySpeedBinding, in: AppModel.flySpeedRange, step: 0.25)
+                    .accessibilityLabel("Fly speed")
+                    .accessibilityValue(DisplayFormat.multiplier(model.flySpeed))
+                Text(DisplayFormat.multiplier(model.flySpeed))
+                    .font(.body.monospacedDigit().weight(.semibold))
+                    .frame(minWidth: 56, alignment: .trailing)
             }
-            Slider(value: flySpeedBinding, in: 0.25...4, step: 0.25)
-                .accessibilityLabel("Fly speed")
-                .accessibilityValue(flySpeedText)
 
-            Button {
-                model.recenter()
-            } label: {
-                Label("Recenter", systemImage: "scope")
-                    .frame(maxWidth: .infinity, minHeight: 44)
+            HStack(spacing: 8) {
+                ForEach(Self.quickFlySpeeds, id: \.self) { value in
+                    let isCurrent = abs(model.flySpeed - value) < 0.01
+                    Button {
+                        model.flySpeed = value
+                    } label: {
+                        Text(DisplayFormat.multiplier(value))
+                            .font(.callout.monospacedDigit())
+                            .frame(maxWidth: .infinity, minHeight: 34)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(isCurrent ? Color.accentColor : nil)
+                    .accessibilityLabel("Fly speed \(DisplayFormat.multiplier(value))")
+                }
+
+                Button {
+                    model.recenter()
+                } label: {
+                    Label("Recenter", systemImage: "scope")
+                        .font(.callout)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 34)
+                }
+                .buttonStyle(.bordered)
+                .help("Back to where the project started. Back returns here.")
             }
-            .buttonStyle(.bordered)
         }
-    }
-
-    private var flySpeedText: String {
-        let speed = model.flySpeed
-        let isHalfStep = (speed * 2).rounded() == speed * 2
-        return String(format: isHalfStep ? "%.1f×" : "%.2f×", Double(speed))
     }
 
     private var handTrackingWarning: String? {
         switch model.hands.status {
         case .denied:
-            return "Hand tracking is not allowed. Enable it for QVision in Settings › Privacy & Security to use Fly mode and the hand panel."
+            return "Hand tracking is not allowed. Enable it for QVision in Settings › Privacy & Security to use Fly mode and the palm button."
         case .unsupported:
             return "Hand tracking isn't available on this device (for example in the Simulator), so Fly mode won't respond."
         case .failed(let message):
@@ -315,20 +294,34 @@ struct ProjectPanelView: View {
         }
     }
 
-    // MARK: - 7. Scene
+    // MARK: - Objects
 
-    private var sceneSection: some View {
-        PanelSection("Scene", systemImage: "cube.transparent", compact: isHand) {
+    private func objectsCard(_ project: Project) -> some View {
+        PanelCard {
+            SectionTitle("Objects", systemImage: "cube.transparent") {
+                InfoPill(text: "\(project.items.count)")
+            }
+
             HStack(spacing: 10) {
-                sceneButton("Import models", systemImage: "square.and.arrow.down") {
+                Button {
                     requestImport()
+                } label: {
+                    Label("Import models", systemImage: "square.and.arrow.down")
+                        .font(.headline)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 44)
                 }
-                sceneButton("Add test cube", systemImage: "cube") {
+                .buttonStyle(.borderedProminent)
+
+                Button {
                     Task { await model.addTestCube() }
+                } label: {
+                    Label("Test cube", systemImage: "cube")
+                        .lineLimit(1)
+                        .frame(minHeight: 44)
+                        .padding(.horizontal, 6)
                 }
-                sceneButton("Reset scene", systemImage: "arrow.counterclockwise") {
-                    model.resetScene()
-                }
+                .buttonStyle(.bordered)
             }
             .disabled(model.isLoading)
 
@@ -344,74 +337,192 @@ struct ProjectPanelView: View {
                 .padding(12)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-        }
-    }
 
-    private func sceneButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .font(.title3)
-                Text(title)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+            ForEach(model.importNotes) { note in
+                importNoteBanner(note, in: project)
             }
-            .frame(maxWidth: .infinity, minHeight: 64)
-        }
-        .buttonStyle(.bordered)
-    }
 
-    /// The file picker is presented by RootView in the main window (reliable there), which is
-    /// opened for it if needed and handed back to the hand panel afterwards.
-    private func requestImport() {
-        model.isImportPickerRequested = true
-        if !model.isMainWindowOpen {
-            openWindow(id: AppModel.mainWindowID)
-        }
-    }
+            if let selectedID = model.selectedItemID,
+               let item = project.items.first(where: { $0.id == selectedID }) {
+                selectedItemStrip(item)
+            }
 
-    // MARK: - 8. Objects
-
-    private var objectsSection: some View {
-        PanelSection("Objects", systemImage: "list.bullet", compact: isHand) {
-            if let project = model.currentProject, !project.items.isEmpty {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(project.items) { item in
-                        objectRow(item, in: project)
-                    }
-                }
-            } else {
+            if project.items.isEmpty {
                 Text("No objects yet. Import a USDZ, USD, Reality or OBJ file, or add a test cube.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(project.items) { item in
+                        objectRow(item, in: project)
+                    }
+                }
             }
         }
+    }
+
+    /// L2: "Detected centimetres → scaled ×0.01 (now 12.4 × 8.1 × 7.9 m)" + a Units fix.
+    private func importNoteBanner(_ note: AppModel.ImportNote, in project: Project) -> some View {
+        let item = project.items.first { $0.id == note.itemID }
+
+        return HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "ruler")
+                .font(.title3)
+                .foregroundStyle(Color.accentColor)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Imported “\(note.itemName)”")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(note.text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let item {
+                    unitsMenu(item, compact: true)
+                }
+            }
+            Spacer(minLength: 4)
+            Button {
+                model.dismissImportNote(note.id)
+            } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 36, height: 36)
+            }
+            .buttonStyle(.borderless)
+            .buttonBorderShape(.circle)
+            .accessibilityLabel("Dismiss")
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func selectedItemStrip(_ item: ProjectItem) -> some View {
+        let locked = model.isItemLocked(item.id)
+        let unit = model.unit(of: item)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: item.primitive == .cube ? "cube.fill" : "cube.transparent.fill")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if let size = model.size(of: item, in: unit) {
+                        Text(DisplayFormat.dimensions(size))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 4)
+                if locked {
+                    InfoPill(text: "Locked", systemImage: "lock.fill")
+                }
+                Button {
+                    model.select(nil)
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 36, height: 36)
+                }
+                .buttonStyle(.borderless)
+                .buttonBorderShape(.circle)
+                .accessibilityLabel("Deselect")
+            }
+
+            HStack(spacing: 8) {
+                unitsMenu(item, compact: false)
+
+                Button {
+                    model.dropItemToFloor(item.id)
+                } label: {
+                    Label("Floor", systemImage: "arrow.down.to.line")
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.bordered)
+                .disabled(locked)
+                .help("Drop to the floor")
+
+                Button(role: .destructive) {
+                    model.removeItem(item.id)
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.bordered)
+                .tint(.red)
+            }
+            .font(.callout)
+        }
+        .padding(12)
+        .background(Color.accentColor.opacity(0.18), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    /// Units fix menu (m, cm, mm, in, ft). Each choice shows the size it would give.
+    private func unitsMenu(_ item: ProjectItem, compact: Bool) -> some View {
+        let current = model.unit(of: item)
+        let locked = model.isItemLocked(item.id)
+
+        return Menu {
+            Section("File units") {
+                unitButtons(item, current: current)
+            }
+        } label: {
+            Label(compact ? "Units: \(current.symbol)" : current.symbol, systemImage: "ruler")
+                .lineLimit(1)
+                .frame(maxWidth: compact ? nil : .infinity, minHeight: 36)
+        }
+        .buttonStyle(.bordered)
+        .disabled(locked || model.isLoading)
+        .help("The units the file was made in")
+        .accessibilityLabel("Units, currently \(current.title)")
+    }
+
+    @ViewBuilder
+    private func unitButtons(_ item: ProjectItem, current: ModelUnit) -> some View {
+        ForEach(ModelUnit.allCases) { unit in
+            Button {
+                model.setItemUnit(item.id, unit)
+            } label: {
+                let title = unitTitle(item, unit)
+                if unit == current {
+                    Label(title, systemImage: "checkmark")
+                } else {
+                    Text(title)
+                }
+            }
+        }
+    }
+
+    private func unitTitle(_ item: ProjectItem, _ unit: ModelUnit) -> String {
+        guard let size = model.size(of: item, in: unit) else { return unit.title }
+        return "\(unit.title): \(DisplayFormat.dimensions(size))"
     }
 
     private func objectRow(_ item: ProjectItem, in project: Project) -> some View {
         let isSelected = model.selectedItemID == item.id
         let layer = project.layer(item.layerID)
         let dimmed = item.isHidden || !(layer?.isVisible ?? true)
-        let isExpanded = isHand && expandedItemID == item.id
 
-        return VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
-                Button {
-                    model.select(isSelected ? nil : item.id)
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: item.primitive == .cube ? "cube" : "cube.transparent")
+        return HStack(spacing: 4) {
+            Button {
+                model.select(isSelected ? nil : item.id)
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: item.primitive == .cube ? "cube" : "cube.transparent")
+                        .foregroundStyle(.secondary)
+                    Text(item.name)
+                        .lineLimit(1)
+                    if layer?.isLocked == true {
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                        Text(item.name)
-                            .lineLimit(1)
-                        if layer?.isLocked == true {
-                            Image(systemName: "lock.fill")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 6)
+                    }
+                    Spacer(minLength: 6)
+                    if project.layers.count > 1 {
                         Text(layer?.name ?? "No layer")
                             .font(.caption)
                             .lineLimit(1)
@@ -419,57 +530,42 @@ struct ProjectPanelView: View {
                             .padding(.vertical, 3)
                             .background(.thinMaterial, in: Capsule())
                     }
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: 48)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .opacity(dimmed ? 0.5 : 1)
-
-                Button {
-                    model.setItemHidden(item.id, !item.isHidden)
-                } label: {
-                    Image(systemName: item.isHidden ? "eye.slash" : "eye")
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.borderless)
-                .buttonBorderShape(.circle)
-                .accessibilityLabel(item.isHidden ? "Show object" : "Hide object")
-
-                if isHand {
-                    Button {
-                        expandedItemID = isExpanded ? nil : item.id
-                    } label: {
-                        Image(systemName: isExpanded ? "chevron.up" : "ellipsis")
-                            .frame(width: 44, height: 44)
-                    }
-                    .buttonStyle(.borderless)
-                    .buttonBorderShape(.circle)
-                    .accessibilityLabel(isExpanded ? "Hide actions" : "More actions")
-                } else {
-                    Menu {
-                        itemMenuActions(item, layers: project.layers)
-                    } label: {
-                        Image(systemName: "ellipsis")
-                            .frame(width: 44, height: 44)
-                    }
-                    .buttonBorderShape(.circle)
-                    .accessibilityLabel("More actions")
-                }
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
-            .padding(.trailing, 4)
+            .buttonStyle(.plain)
+            .opacity(dimmed ? 0.5 : 1)
 
-            if isExpanded {
-                inlineActions(item, layers: project.layers)
+            Button {
+                model.setItemHidden(item.id, !item.isHidden)
+            } label: {
+                Image(systemName: item.isHidden ? "eye.slash" : "eye")
+                    .frame(width: 40, height: 40)
             }
+            .buttonStyle(.borderless)
+            .buttonBorderShape(.circle)
+            .accessibilityLabel(item.isHidden ? "Show object" : "Hide object")
+
+            Menu {
+                itemMenuActions(item, layers: project.layers)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 40, height: 40)
+            }
+            .buttonBorderShape(.circle)
+            .accessibilityLabel("More actions")
         }
-        .background(isSelected ? Color.accentColor.opacity(0.25) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(.trailing, 2)
+        .background(isSelected ? Color.accentColor.opacity(0.22) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    /// Menu content for the `.window` context.
     @ViewBuilder
     private func itemMenuActions(_ item: ProjectItem, layers: [Layer]) -> some View {
+        let locked = model.isItemLocked(item.id)
+
         Button {
             Task { await model.duplicateItem(item.id) }
         } label: {
@@ -478,19 +574,28 @@ struct ProjectPanelView: View {
         .disabled(model.isLoading)
 
         Menu {
-            ForEach(layers) { layer in
-                Button {
-                    model.moveItem(item.id, toLayer: layer.id)
-                } label: {
-                    if layer.id == item.layerID {
-                        Label(layer.name, systemImage: "checkmark")
-                    } else {
-                        Text(layer.name)
+            unitButtons(item, current: model.unit(of: item))
+        } label: {
+            Label("Units", systemImage: "ruler")
+        }
+        .disabled(locked)
+
+        if layers.count > 1 {
+            Menu {
+                ForEach(layers) { layer in
+                    Button {
+                        model.moveItem(item.id, toLayer: layer.id)
+                    } label: {
+                        if layer.id == item.layerID {
+                            Label(layer.name, systemImage: "checkmark")
+                        } else {
+                            Text(layer.name)
+                        }
                     }
                 }
+            } label: {
+                Label("Move to Layer", systemImage: "square.3.layers.3d")
             }
-        } label: {
-            Label("Move to Layer", systemImage: "square.3.layers.3d")
         }
 
         Button {
@@ -498,7 +603,7 @@ struct ProjectPanelView: View {
         } label: {
             Label("Drop to Floor", systemImage: "arrow.down.circle")
         }
-        .disabled(model.isItemLocked(item.id))
+        .disabled(locked)
 
         Button(role: .destructive) {
             model.removeItem(item.id)
@@ -507,65 +612,116 @@ struct ProjectPanelView: View {
         }
     }
 
-    /// Inline action strip for the `.hand` context (no menus in attachments).
-    private func inlineActions(_ item: ProjectItem, layers: [Layer]) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                inlineButton("Duplicate", systemImage: "plus.square.on.square") {
-                    Task { await model.duplicateItem(item.id) }
-                }
-                .disabled(model.isLoading)
+    /// The file picker is presented by RootView in the main window (reliable there), which is
+    /// opened for it if needed and handed back to the panel window afterwards.
+    private func requestImport() {
+        model.isImportPickerRequested = true
+        if !model.isMainWindowOpen {
+            openWindow(id: AppModel.mainWindowID)
+        }
+    }
 
-                inlineButton("Drop to floor", systemImage: "arrow.down.circle") {
-                    model.dropItemToFloor(item.id)
-                }
-                .disabled(model.isItemLocked(item.id))
+    // MARK: - Advanced
 
-                inlineButton("Delete", systemImage: "trash") {
-                    expandedItemID = nil
-                    model.removeItem(item.id)
-                }
-                .tint(.red)
-            }
+    private var advancedCard: some View {
+        let percent = model.sceneScalePercent
 
-            if layers.count > 1 {
-                Text("Move to layer")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(layers) { layer in
-                            Button {
-                                model.moveItem(item.id, toLayer: layer.id)
-                            } label: {
-                                Label(layer.name, systemImage: layer.id == item.layerID ? "checkmark" : "square.3.layers.3d")
-                                    .font(.callout)
-                                    .lineLimit(1)
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(layer.id == item.layerID ? Color.accentColor : nil)
+        return DisclosureGroup(isExpanded: $isAdvancedExpanded) {
+            VStack(alignment: .leading, spacing: 14) {
+                // Scene scale
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Scene scale 1:\(DisplayFormat.scaleDenominator(percent: percent))")
+                        .font(.headline.monospacedDigit())
+                    Spacer(minLength: 8)
+                    Text("\(Int(percent.rounded())) %")
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(value: scaleBinding, in: 1...100, step: 1)
+                    .accessibilityLabel("Scene scale")
+                    .accessibilityValue("\(Int(percent.rounded())) percent")
+
+                HStack(spacing: 6) {
+                    ForEach(Self.quickScales, id: \.self) { value in
+                        let isCurrent = Int(percent.rounded()) == Int(value)
+                        Button {
+                            model.sceneScalePercent = value
+                        } label: {
+                            Text("\(Int(value))%")
+                                .font(.callout.monospacedDigit())
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                                .frame(maxWidth: .infinity, minHeight: 34)
                         }
+                        .buttonStyle(.bordered)
+                        .tint(isCurrent ? Color.accentColor : nil)
+                        .accessibilityLabel("Scale \(Int(value)) percent")
                     }
                 }
+
+                Toggle(isOn: tabletopBinding) {
+                    Label("Table height", systemImage: "arrow.up.to.line")
+                }
+                .disabled(percent >= 100)
+
+                Text(percent >= 100
+                     ? "100 % is real size. Scale the whole scene down to view it like a model."
+                     : "The whole scene shrinks in place. Table height lifts it to 75 cm.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Divider()
+
+                Toggle(isOn: snapBinding) {
+                    Label("Snap to floor while dragging", systemImage: "arrow.down.to.line")
+                }
+
+                Button {
+                    model.resetScene()
+                } label: {
+                    Label("Reset scene", systemImage: "arrow.counterclockwise")
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isLoading)
+                .help("Every object back to where it was first placed. Undo brings them back.")
+            }
+            .padding(.top, 12)
+        } label: {
+            HStack(spacing: 10) {
+                Label("Advanced", systemImage: "slider.horizontal.3")
+                    .font(.headline)
+                Spacer(minLength: 8)
+                Text("Scale 1:\(DisplayFormat.scaleDenominator(percent: percent)) · Snap \(model.snapToFloor ? "on" : "off")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
-        .padding(.bottom, 12)
+        .qvCard(padding: 16, cornerRadius: 20)
     }
 
-    private func inlineButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
+    // MARK: - Banners
+
+    private var showsStageClosedBanner: Bool {
+        model.currentProject != nil && model.stageState == .closed && !model.isTransitioning
+    }
+
+    private var stageClosedBanner: some View {
+        HStack(spacing: 12) {
+            Label("The 3D stage is closed.", systemImage: "cube.transparent")
                 .font(.callout)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .frame(maxWidth: .infinity, minHeight: 40)
+            Spacer(minLength: 8)
+            Button("Open Stage") {
+                model.requestStageSync()
+            }
+            .buttonStyle(.borderedProminent)
         }
-        .buttonStyle(.bordered)
+        .padding(14)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
-
-    // MARK: - Errors (inline; alerts aren't reliable from attachments)
 
     private func errorBanner(_ message: String) -> some View {
         HStack(alignment: .top, spacing: 12) {
@@ -590,36 +746,47 @@ struct ProjectPanelView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
-    // MARK: - 9. Footer
+    // MARK: - Footer
 
     private var footer: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Button {
                 toggleLayersWindow()
             } label: {
                 Label(model.isLayersWindowOpen ? "Hide Layers" : "Layers", systemImage: "square.3.layers.3d")
                     .font(.headline)
                     .lineLimit(1)
-                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+            }
+            .buttonStyle(.bordered)
+            .disabled(model.currentProject == nil)
+
+            Button {
+                toggleInspectorWindow()
+            } label: {
+                Label(model.isInspectorWindowOpen ? "Hide Inspector" : "Inspector", systemImage: "info.circle")
+                    .font(.headline)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, minHeight: 48)
             }
             .buttonStyle(.bordered)
             .disabled(model.currentProject == nil)
 
             Button(role: .destructive) {
-                leave()
+                model.requestLeave()
             } label: {
                 Label("Leave", systemImage: "rectangle.portrait.and.arrow.right")
                     .font(.headline)
                     .lineLimit(1)
-                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .frame(maxWidth: .infinity, minHeight: 48)
             }
             .buttonStyle(.bordered)
             .tint(.red)
-            .disabled(isLeaving || model.currentProject == nil)
+            .disabled(model.isTransitioning || model.currentProject == nil)
+            .help("Save and return to Home")
         }
-        .controlSize(.large)
-        .padding(.horizontal, isHand ? 16 : 24)
-        .padding(.vertical, isHand ? 14 : 18)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
     }
 
     private func toggleLayersWindow() {
@@ -630,46 +797,11 @@ struct ProjectPanelView: View {
         }
     }
 
-    /// Leave: back to All Projects.
-    /// openWindow(main) → closeProject() → dismiss Layers / Inspector → dismissImmersiveSpace().
-    private func leave() {
-        guard !isLeaving else { return }
-        isLeaving = true
-
-        let layersOpen = model.isLayersWindowOpen
-        let inspectorOpen = model.isInspectorWindowOpen
-
-        if !model.isMainWindowOpen {
-            openWindow(id: AppModel.mainWindowID)
-        }
-        model.closeProject()
-        if layersOpen {
-            dismissWindow(id: AppModel.layersWindowID)
-        }
-        if inspectorOpen {
+    private func toggleInspectorWindow() {
+        if model.isInspectorWindowOpen {
             dismissWindow(id: AppModel.inspectorWindowID)
-        }
-
-        // Claim the transition synchronously so RootView's own stage sync (if its window is
-        // alive) sees `.transitioning` and doesn't dismiss the space a second time.
-        let needsDismiss = model.stageState == .open
-        if needsDismiss {
-            model.stageState = .transitioning
-        }
-        let appModel = model
-        let dismissSpace = dismissImmersiveSpace
-        let panelOpen = model.isProjectPanelVisible
-        let closeWindow = dismissWindow
-        Task { @MainActor in
-            if needsDismiss {
-                await dismissSpace()
-                appModel.stageState = .closed
-            }
-            isLeaving = false
-            // The panel window is where Leave was tapped; close it last.
-            if panelOpen {
-                closeWindow(id: AppModel.panelWindowID)
-            }
+        } else {
+            openWindow(id: AppModel.inspectorWindowID)
         }
     }
 
@@ -716,29 +848,18 @@ struct ProjectPanelView: View {
     }
 }
 
-/// A titled card grouping one part of the project panel.
-private struct PanelSection<Content: View>: View {
-    let title: String
-    let systemImage: String
-    let compact: Bool
+/// A compact card grouping one part of the project panel.
+private struct PanelCard<Content: View>: View {
     let content: Content
 
-    init(_ title: String, systemImage: String, compact: Bool, @ViewBuilder content: () -> Content) {
-        self.title = title
-        self.systemImage = systemImage
-        self.compact = compact
+    init(@ViewBuilder content: () -> Content) {
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 10 : 14) {
-            Label(title, systemImage: systemImage)
-                .font(.headline)
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 12) {
             content
         }
-        .padding(compact ? 16 : 20)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: compact ? 20 : 24, style: .continuous))
+        .qvCard(padding: 16, cornerRadius: 20)
     }
 }

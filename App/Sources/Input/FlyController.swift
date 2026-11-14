@@ -21,7 +21,7 @@ import simd
         }
     }
 
-    /// Multiplier on translation gain and max speed. Default 1.
+    /// Multiplier on translation gain and max speed. Default 1; the panel slider spans 0.25...10.
     var speed: Float = 1
 
     private(set) var isFlying: Bool = false
@@ -65,10 +65,12 @@ import simd
     // MARK: Tuning
 
     // Translation: x = max(0, |d| - deadzone);  speed(x) = (linear·x + quadratic·x²) · speed, capped.
+    // v0.7 L3: the whole curve is 3x the v0.6 one (2.5 / 45 / 14), same shape and deadzone,
+    // so the first centimetres past the deadzone stay precise while a full reach is 3x faster.
     private static let translationDeadzone: Float = 0.025      // m
-    private static let translationLinearGain: Float = 2.5       // (m/s) per m, × speed
-    private static let translationQuadraticGain: Float = 45     // (m/s) per m², × speed
-    private static let maxSpeed: Float = 14                     // m/s, × speed
+    private static let translationLinearGain: Float = 7.5       // (m/s) per m, × speed
+    private static let translationQuadraticGain: Float = 135    // (m/s) per m², × speed
+    private static let maxSpeed: Float = 40                     // m/s, × speed
     // Yaw: a = max(0, |Δθ| - deadzone);  ω = linear·a + quadratic·a², capped.
     private static let yawDeadzone: Float = 5 * Float.pi / 180  // rad
     private static let yawLinearGain: Float = 1.2               // (rad/s) per rad
@@ -92,9 +94,9 @@ import simd
     private static let arrowMeshLength: Float = 0.04            // m, unscaled cone height
     private static let arrowMinLength: Float = 0.03             // m, at rest
     private static let arrowMaxLength: Float = 0.12             // m, at >= arrowFullSpeed
-    private static let arrowFullSpeed: Float = 5                // m/s
+    private static let arrowFullSpeed: Float = 15               // m/s (3x with the v0.7 curve)
     /// Upper bounds (m/s) of speed buckets 0...2; bucket 3 is everything above the last one.
-    private static let speedBucketLimits: [Float] = [0.75, 2, 5]
+    private static let speedBucketLimits: [Float] = [2, 6, 15]
 
     // MARK: Init
 
@@ -264,7 +266,7 @@ import simd
         yawRate = 0
     }
 
-    /// x = |d| - deadzone,  |v| = (2.5·x + 45·x²)·speed,  |v| <= 14·speed.
+    /// x = |d| - deadzone,  |v| = (7.5·x + 135·x²)·speed,  |v| <= 40·speed.
     /// Direction is exactly where the fists moved (d normalised).
     private func translationTarget(midpoint: SIMD3<Float>) -> SIMD3<Float> {
         let s = max(0, speed)

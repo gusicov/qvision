@@ -15,24 +15,27 @@ struct QVisionApp: App {
 
     // `SwiftUI.` prefix: RealityKit also has a type named `Scene`.
     var body: some SwiftUI.Scene {
-        // All Projects. Closed while a project is open (the project panel lives on the left hand).
+        // Home (All Projects + Server). Closed while a project is open and the panel window is
+        // in use; the only window that may be restored at launch.
         WindowGroup(id: AppModel.mainWindowID) {
             RootView()
                 .environment(model)
                 .environment(server)
         }
-        .defaultSize(width: 640, height: 780)
+        .defaultSize(width: 760, height: 820)
 
         // Project panel: a real window (system move bar underneath), opened/closed from the
         // palm button. Placed as a utility panel: close to the user, slightly below eye level.
+        // Never restored: it only makes sense with an open project (L6).
         WindowGroup(id: AppModel.panelWindowID) {
             ProjectPanelWindowView()
                 .environment(model)
         }
-        .defaultSize(width: 540, height: 820)
+        .defaultSize(width: 520, height: 780)
         .defaultWindowPlacement { _, _ in
             WindowPlacement(.utilityPanel)
         }
+        .restorationBehavior(.disabled)
 
         // Movable Layers window (system window bar), opened from the panel.
         WindowGroup(id: AppModel.layersWindowID) {
@@ -40,6 +43,7 @@ struct QVisionApp: App {
                 .environment(model)
         }
         .defaultSize(width: 440, height: 620)
+        .restorationBehavior(.disabled)
 
         // Movable Inspector window, opened in Inspect mode.
         WindowGroup(id: AppModel.inspectorWindowID) {
@@ -47,13 +51,15 @@ struct QVisionApp: App {
                 .environment(model)
         }
         .defaultSize(width: 480, height: 680)
+        .restorationBehavior(.disabled)
 
         // The stage. Mixed = your room, Full = generated environment only.
         ImmersiveSpace(id: AppModel.stageSpaceID) {
             StageView()
+                .installsSceneActions()
+                .onAppear { model.stageDidAppear() }
+                .onDisappear { model.stageDidDisappear() }
                 .environment(model)
-                .onAppear { model.stageState = .open }
-                .onDisappear { model.stageState = .closed }
         }
         .immersionStyle(selection: immersionBinding, in: .mixed, .full)
 

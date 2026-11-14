@@ -75,8 +75,59 @@ struct ProjectItem: Codable, Identifiable, Hashable {
     var isHidden: Bool = false
     /// Internal parts (USD hierarchy paths) the user hid in Inspect mode. Optional for old JSON.
     var hiddenPartPaths: [String]? = nil
+    /// v0.7: units factor applied to the file's native size (0.01 = authored in centimetres).
+    /// nil = 1 (metres). Optional so older project.json files still decode. The stage reads
+    /// `unitScale ?? 1` when it (re)loads the item; the Units menu changes it.
+    var unitScale: Float? = nil
 
     var hiddenParts: Set<String> { Set(hiddenPartPaths ?? []) }
+    var unitFactor: Float { unitScale ?? 1 }
+}
+
+/// v0.7: the units a model file was authored in (Units fix menu). `factor` converts the
+/// file's native numbers to metres.
+enum ModelUnit: String, CaseIterable, Identifiable {
+    case meters, centimeters, millimeters, inches, feet
+
+    var id: String { rawValue }
+
+    var factor: Float {
+        switch self {
+        case .meters: return 1
+        case .centimeters: return 0.01
+        case .millimeters: return 0.001
+        case .inches: return 0.0254
+        case .feet: return 0.3048
+        }
+    }
+
+    /// Short symbol: "m", "cm", "mm", "in", "ft".
+    var symbol: String {
+        switch self {
+        case .meters: return "m"
+        case .centimeters: return "cm"
+        case .millimeters: return "mm"
+        case .inches: return "in"
+        case .feet: return "ft"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .meters: return "Meters (m)"
+        case .centimeters: return "Centimeters (cm)"
+        case .millimeters: return "Millimeters (mm)"
+        case .inches: return "Inches (in)"
+        case .feet: return "Feet (ft)"
+        }
+    }
+
+    /// The unit whose factor is closest (in log space) to `factor`.
+    static func closest(to factor: Float) -> ModelUnit {
+        guard factor.isFinite, factor > 0 else { return .meters }
+        let target = log(factor)
+        return allCases.min { abs(log($0.factor) - target) < abs(log($1.factor) - target) } ?? .meters
+    }
 }
 
 struct Project: Codable, Identifiable, Hashable {

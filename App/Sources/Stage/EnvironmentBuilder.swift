@@ -10,9 +10,11 @@ import simd
 ///
 /// Primary path ("baked"): textures generated offline by `tools/make_environments.py`
 /// (bundled from `App/Resources/Environments/`):
-/// - an equirectangular sky on an inward-facing dome (radius 450 m),
+/// - an equirectangular sky on an inward-facing dome (radius 450 m at scale 1; StageController
+///   centres it on the head every frame and scales it up for large content),
 /// - a PBR near floor (albedo + normal + roughness, one 4 m tile = 4 x 4 slabs of 1 m),
-/// - a far ground disc that fades into the sky haze through a radial opacity texture,
+/// - a far ground disc that fades into the sky haze through a radial opacity texture (follows the
+///   head in X/Z and scales with the dome),
 /// - image-based lighting made from the same sky image,
 /// - a directional sun / moon with shadows, aligned with the sun painted in the sky.
 ///
@@ -22,6 +24,11 @@ enum EnvironmentBuilder {
     /// Name of the child entity that carries the `ImageBasedLightComponent`.
     /// StageController looks it up to point `ImageBasedLightReceiverComponent` at it.
     static let imageBasedLightName = "QVEnvironmentIBL"
+    /// Names of the entities StageController moves every frame so they follow the head
+    /// (translation only) and rescales to fit the content (v0.7 L4). The near floor ("Ground")
+    /// is never moved: it stays world-locked at y = 0.
+    static let skyDomeName = "SkyDome"
+    static let farGroundName = "FarGround"
 
     @MainActor static func make(_ preset: EnvironmentPreset) async -> Entity {
         let look = Look.forPreset(preset)
@@ -147,7 +154,8 @@ enum EnvironmentBuilder {
 
     // MARK: - Geometry constants
 
-    private static let skyRadius: Float = 450
+    /// Baked sky dome radius at entity scale 1 (StageController reads the mesh bounds; this is its fallback).
+    static let skyRadius: Float = 450
     private static let nearFloorSize: Float = 120  // +-60 m
     private static let floorTileMeters: Float = 4  // one 2048 px texture tile
     private static let farGroundRadius: Float = 440
@@ -201,7 +209,7 @@ enum EnvironmentBuilder {
             // Fallback: RealityKit's sphere (lower tessellation, assumed same u/v layout).
             sky = ModelEntity(mesh: MeshResource.generateSphere(radius: skyRadius), materials: [material])
         }
-        sky.name = "SkyDome"
+        sky.name = skyDomeName
         // Mirror on X so the outward-facing triangles are seen from the inside, like the
         // classic generateSphere + scale [-1, 1, 1] panorama setup. The dome mesh below is built
         // so that, after this mirror, u = 0.5 points at -Z and u increases to the right.
@@ -257,7 +265,7 @@ enum EnvironmentBuilder {
         }
         let size = farGroundRadius * 2
         let ground = ModelEntity(mesh: MeshResource.generatePlane(width: size, depth: size), materials: [material])
-        ground.name = "FarGround"
+        ground.name = farGroundName
         ground.position = [0, -0.01, 0]
         return ground
     }
@@ -619,7 +627,7 @@ enum EnvironmentBuilder {
         }
 
         let sky = ModelEntity(mesh: mesh, materials: [material])
-        sky.name = "SkyDome"
+        sky.name = skyDomeName
         // Mirror on X so the sphere's faces are visible from the inside.
         sky.scale = [-1, 1, 1]
         return sky
