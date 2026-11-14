@@ -38,7 +38,12 @@ struct RootView: View {
     var body: some View {
         ZStack {
             if model.currentProject == nil {
-                ProjectsHomeView()
+                TabView {
+                    ProjectsHomeView()
+                        .tabItem { Label("Projects", systemImage: "square.stack.3d.up") }
+                    ServerHomeView()
+                        .tabItem { Label("Server", systemImage: "server.rack") }
+                }
             } else {
                 ProjectPanelView(context: .window)
             }

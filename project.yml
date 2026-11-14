@@ -7,16 +7,24 @@ options:
     visionOS: "2.0"
   createIntermediateGroups: true
 
+# NVIDIA CloudXR client framework (binary Swift package, NVIDIA SLA): Server mode.
+packages:
+  CloudXRKit:
+    url: https://github.com/NVIDIA/cloudxr-framework
+    exactVersion: 6.2.0  # client and CloudXR Runtime versions must match (NVIDIA FAQ)
+
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.4.0"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "6"
 
 targets:
   QVision:
     type: application
     platform: visionOS
+    dependencies:
+      - package: CloudXRKit
     sources:
       - path: App/Sources
       - path: App/Assets.xcassets
@@ -42,6 +50,7 @@ targets:
         # headset ("On My Apple Vision Pro › QVision").
         NSHandsTrackingUsageDescription: QVision uses hand tracking for fly mode (clench both fists to move) and for the palm Layers menu.
         NSWorldSensingUsageDescription: QVision uses world tracking to place models in front of you.
+        NSLocalNetworkUsageDescription: QVision connects to your PC or office server on the local network to stream Unreal Engine scenes (NVIDIA CloudXR).
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:

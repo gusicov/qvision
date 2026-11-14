@@ -1,12 +1,16 @@
 import SwiftUI
 import RealityKit
+import CloudXRKit
 
 @main
 struct QVisionApp: App {
     @State private var model = AppModel()
+    /// Server mode: NVIDIA CloudXR streaming (Unreal on a PC / the office server).
+    @State private var server = ServerSessionController()
 
     init() {
         StageComponents.register()
+        CloudXRKit.registerSystems()
     }
 
     // `SwiftUI.` prefix: RealityKit also has a type named `Scene`.
@@ -15,6 +19,7 @@ struct QVisionApp: App {
         WindowGroup(id: AppModel.mainWindowID) {
             RootView()
                 .environment(model)
+                .environment(server)
         }
         .defaultSize(width: 640, height: 780)
 
@@ -51,6 +56,27 @@ struct QVisionApp: App {
                 .onDisappear { model.stageState = .closed }
         }
         .immersionStyle(selection: immersionBinding, in: .mixed, .full)
+
+        // Server mode: the CloudXR stream (full immersion by default; "show my room" = mixed).
+        ImmersiveSpace(id: ServerSessionController.streamSpaceID) {
+            StreamImmersiveView()
+                .environment(server)
+                .environment(model)
+        }
+        .immersionStyle(selection: streamImmersionBinding, in: .mixed, .full)
+    }
+
+    private var streamImmersionBinding: Binding<any ImmersionStyle> {
+        Binding(
+            get: {
+                server.showRoom
+                    ? (MixedImmersionStyle.mixed as any ImmersionStyle)
+                    : (FullImmersionStyle.full as any ImmersionStyle)
+            },
+            set: { newValue in
+                server.showRoom = !(newValue is FullImmersionStyle)
+            }
+        )
     }
 
     private var immersionBinding: Binding<any ImmersionStyle> {
