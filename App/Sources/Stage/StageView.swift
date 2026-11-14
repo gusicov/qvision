@@ -134,21 +134,43 @@ struct StageView: View {
         model.interactionMode == .edit
     }
 
+    /// Belt-and-braces guard for fly mode: clenching / opening the fists produces a system
+    /// pinch. Models aren't hit-testable while fly mode is on (StageController), and on top of
+    /// that every gesture handler ignores input while flying and for 0.3 s after release.
+    private var isFlightBlockingInput: Bool {
+        model.isFlyModeEnabled || model.fly.isFlyingOrJustReleased
+    }
+
     private var dragGesture: some Gesture {
         DragGesture()
             .targetedToAnyEntity()
             .onChanged { value in
+                let state = gestureState
+                if isFlightBlockingInput {
+                    // Put a model that was being dragged back where the drag started, and ignore
+                    // the rest of this drag.
+                    if let id = state.dragItemID, let start = state.dragStartLocalPosition,
+                       let root = model.stage.entity(for: id) {
+                        root.position = start
+                        model.stage.refreshSelectionIndicator()
+                    }
+                    state.resetDrag()
+                    state.abortedDragStart = value.startLocation3D
+                    return
+                }
+                guard state.abortedDragStart != value.startLocation3D else { return }
+                state.abortedDragStart = nil
                 guard isEditing,
                       let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
-                let state = gestureState
                 if state.dragItemID != id || state.dragStartLocation3D != value.startLocation3D {
                     state.dragItemID = id
                     state.dragStartLocation3D = value.startLocation3D
                     state.dragStartScene = value.convert(value.startLocation3D, from: .local, to: .scene)
                     state.dragStartPosition = root.position(relativeTo: nil)
+                    state.dragStartLocalPosition = root.position
                 }
                 guard let startScene = state.dragStartScene,
                       let startPosition = state.dragStartPosition else { return }
@@ -164,6 +186,7 @@ struct StageView: View {
                     model.itemTransformChanged(hit.id, transform: hit.root.transform)
                 }
                 state.resetDrag()
+                state.abortedDragStart = nil
             }
     }
 
@@ -171,12 +194,23 @@ struct StageView: View {
         MagnifyGesture()
             .targetedToAnyEntity()
             .onChanged { value in
-                guard isEditing,
+                let state = gestureState
+                if isFlightBlockingInput {
+                    if let id = state.scaleItemID, let start = state.startScale,
+                       let root = model.stage.entity(for: id) {
+                        root.scale = start
+                        model.stage.refreshSelectionIndicator()
+                    }
+                    state.resetScale()
+                    state.isScaleAborted = true
+                    return
+                }
+                guard !state.isScaleAborted,
+                      isEditing,
                       let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
-                let state = gestureState
                 if state.scaleItemID != id || state.startScale == nil {
                     state.scaleItemID = id
                     state.startScale = root.scale
@@ -198,6 +232,7 @@ struct StageView: View {
                     model.stage.refreshSelectionIndicator()
                 }
                 state.resetScale()
+                state.isScaleAborted = false
             }
     }
 
@@ -205,12 +240,23 @@ struct StageView: View {
         RotateGesture3D(constrainedToAxis: .y)
             .targetedToAnyEntity()
             .onChanged { value in
-                guard isEditing,
+                let state = gestureState
+                if isFlightBlockingInput {
+                    if let id = state.rotateItemID, let start = state.startOrientation,
+                       let root = model.stage.entity(for: id) {
+                        root.orientation = start
+                        model.stage.refreshSelectionIndicator()
+                    }
+                    state.resetRotation()
+                    state.isRotationAborted = true
+                    return
+                }
+                guard !state.isRotationAborted,
+                      isEditing,
                       let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 let id = hit.id
                 let root = hit.root
-                let state = gestureState
                 if state.rotateItemID != id || state.startOrientation == nil {
                     state.rotateItemID = id
                     state.startOrientation = root.orientation
@@ -231,6 +277,7 @@ struct StageView: View {
                     model.itemTransformChanged(hit.id, transform: hit.root.transform)
                 }
                 state.resetRotation()
+                state.isRotationAborted = false
             }
     }
 
@@ -238,7 +285,10 @@ struct StageView: View {
         TapGesture()
             .targetedToAnyEntity()
             .onEnded { value in
-                guard let hit = Self.itemRoot(of: value.entity),
+                // View mode: models are locked (and not hit-testable, so this rarely fires).
+                guard model.interactionMode != .view,
+                      !isFlightBlockingInput,
+                      let hit = Self.itemRoot(of: value.entity),
                       !model.isItemLocked(hit.id) else { return }
                 if model.interactionMode == .inspect {
                     let partID = model.stage.partID(for: value.entity, itemID: hit.id)
@@ -271,18 +321,28 @@ final class StageGestureState {
     var dragStartLocation3D: Point3D?
     var dragStartScene: SIMD3<Float>?
     var dragStartPosition: SIMD3<Float>?
+    /// Item position relative to its parent (contentRoot) at drag start; stable while the
+    /// world moves, so a drag interrupted by fly mode can be undone.
+    var dragStartLocalPosition: SIMD3<Float>?
+    /// Start location of a drag cancelled by fly mode: the rest of that drag is ignored.
+    var abortedDragStart: Point3D?
 
     var scaleItemID: UUID?
     var startScale: SIMD3<Float>?
+    /// A scale gesture was cancelled by fly mode; ignored until it ends.
+    var isScaleAborted = false
 
     var rotateItemID: UUID?
     var startOrientation: simd_quatf?
+    /// A rotation gesture was cancelled by fly mode; ignored until it ends.
+    var isRotationAborted = false
 
     func resetDrag() {
         dragItemID = nil
         dragStartLocation3D = nil
         dragStartScene = nil
         dragStartPosition = nil
+        dragStartLocalPosition = nil
     }
 
     func resetScale() {

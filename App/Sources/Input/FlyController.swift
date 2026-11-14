@@ -26,6 +26,16 @@ import simd
 
     private(set) var isFlying: Bool = false
 
+    /// true while flying and for `releaseGuard` seconds after the grab ends. Gesture handlers
+    /// use it to ignore the system pinch that clenched / opening fists produce.
+    var isFlyingOrJustReleased: Bool {
+        isFlying || ProcessInfo.processInfo.systemUptime - lastFlightEnd < Self.releaseGuard
+    }
+
+    /// Uptime (s) when the last grab ended.
+    private var lastFlightEnd: TimeInterval = -1_000
+    private static let releaseGuard: TimeInterval = 0.3
+
     /// Small ring (+ direction arrow) shown at the grab point while flying. StageView adds it to content
     /// at the top level (NOT under worldRoot), so it stays fixed relative to the user.
     let indicator: Entity
@@ -237,6 +247,9 @@ import simd
     }
 
     private func endGrab() {
+        if isFlying {
+            lastFlightEnd = ProcessInfo.processInfo.systemUptime
+        }
         isFlying = false
         trackingLossTime = 0
         heldTargetVelocity = .zero

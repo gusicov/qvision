@@ -67,17 +67,24 @@ final class AppModel {
         }
     }
 
+    /// While fly mode is on, models are never hit-testable (clenched fists trigger the system
+    /// pinch, which would otherwise grab whatever model is under the hands).
     var isFlyModeEnabled: Bool = false {
-        didSet { fly.isEnabled = isFlyModeEnabled }
+        didSet {
+            fly.isEnabled = isFlyModeEnabled
+            guard oldValue != isFlyModeEnabled else { return }
+            applyInteractionToStage()
+        }
     }
 
     // MARK: v0.3 state
 
-    /// Edit = move / scale / rotate. Inspect = nothing moves, tap shows information.
-    var interactionMode: InteractionMode = .edit {
+    /// View = locked (models can't be targeted). Edit = move / scale / rotate.
+    /// Inspect = nothing moves, tap shows information. Every project opens in View.
+    var interactionMode: InteractionMode = .view {
         didSet {
             guard oldValue != interactionMode else { return }
-            stage.setInspectMode(interactionMode == .inspect)
+            applyInteractionToStage()
             selectedPartID = nil
             if interactionMode == .inspect, let id = selectedItemID {
                 // Something is already selected: show it right away.
@@ -165,6 +172,7 @@ final class AppModel {
         self.fly = FlyController(hands: handService)
         self.projects = store.loadAll()
         self.fly.speed = 1
+        applyInteractionToStage()
     }
 
     // MARK: - Projects
@@ -221,7 +229,7 @@ final class AppModel {
             mainWindowHandedOffProjectID = nil
         }
         currentProject = project
-        interactionMode = .edit
+        interactionMode = .view
         selectedItemID = nil
         selectedPartID = nil
         inspection = nil
@@ -240,13 +248,13 @@ final class AppModel {
         // The user may have left the project while it was loading.
         guard currentProject?.id == id else { return }
         stage.setEnvironment(project.environment, mode: project.viewMode)
-        stage.setInspectMode(false)
+        applyInteractionToStage()
         applySceneScale()
     }
 
     func closeProject() {
         isFlyModeEnabled = false
-        interactionMode = .edit
+        interactionMode = .view
         pendingSave?.cancel()
         pendingSave = nil
         if let project = currentProject {
@@ -675,6 +683,13 @@ final class AppModel {
         }
         list.sort { $0.modifiedAt > $1.modifiedAt }
         projects = list
+    }
+
+    /// Pushes the hit-testing state to the stage: items are targetable only in Edit / Inspect,
+    /// and never while fly mode is on.
+    private func applyInteractionToStage() {
+        stage.setInteraction(inspect: interactionMode == .inspect,
+                             itemsTargetable: interactionMode != .view && !isFlyModeEnabled)
     }
 
     private func pushLayersToStage() {

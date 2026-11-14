@@ -110,12 +110,39 @@ struct Project: Codable, Identifiable, Hashable {
 // MARK: - v0.3: interaction + inspection
 
 enum InteractionMode: String, CaseIterable, Identifiable {
+    case view      // locked: models can't be targeted; gaze and pinch pass through to the UI
     case edit      // move / scale / rotate
     case inspect   // nothing moves; tap shows information
 
     var id: String { rawValue }
-    var title: String { self == .edit ? "Edit" : "Inspect" }
-    var systemImage: String { self == .edit ? "hand.draw" : "info.circle" }
+
+    var title: String {
+        switch self {
+        case .view: return "View"
+        case .edit: return "Edit"
+        case .inspect: return "Inspect"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .view: return "lock"
+        case .edit: return "hand.draw"
+        case .inspect: return "info.circle"
+        }
+    }
+
+    /// One-line hint shown under the Mode picker.
+    var hint: String {
+        switch self {
+        case .view:
+            return "Models are locked: you can't select or move them, so panels and buttons are always reachable."
+        case .edit:
+            return "Pinch and drag to move. Pinch with both hands to scale, twist to rotate."
+        case .inspect:
+            return "Nothing moves. Tap a model, or a part of it, to see its details in the Inspector."
+        }
+    }
 }
 
 /// One node of a model's internal hierarchy (the "layers inside the USDZ").

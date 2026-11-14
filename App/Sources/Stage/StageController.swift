@@ -38,8 +38,12 @@ enum StageLoadError: LocalizedError {
     /// Last placement point (contentRoot space); scene-scale pivot when there are no items.
     private var lastPlacement: SIMD3<Float>?
 
-    // Inspect state
+    // Interaction state (pushed by AppModel.applyInteractionToStage).
     private var isInspectMode = false
+    /// false in View mode and while fly mode is on: no item root or part has an InputTarget,
+    /// and none of our colliders / hover effects are present, so gaze and pinch pass through models to windows,
+    /// the palm button and attachments. Starts false (every project opens in View).
+    private var itemsTargetable = false
 
     // Environment state
     private var environments: [EnvironmentPreset: Entity] = [:]
@@ -163,7 +167,8 @@ enum StageLoadError: LocalizedError {
             itemRoot.transform = item.transform.transform
         }
 
-        // 3. Interaction: one bounding box in root space.
+        // 3. Interaction: one tight bounding box in root space. Collision, InputTarget and
+        //    HoverEffect are set (or not) by `refreshTargeting` below, per interaction mode.
         let shape: ShapeResource
         if hasBounds {
             let size = SIMD3<Float>(
@@ -176,11 +181,8 @@ enum StageLoadError: LocalizedError {
             shape = ShapeResource.generateBox(size: SIMD3<Float>(repeating: 0.1))
         }
         let rootCollision = CollisionComponent(shapes: [shape])
-        itemRoot.components.set(rootCollision)
-        itemRoot.components.set(InputTargetComponent())
-        itemRoot.components.set(HoverEffectComponent())
         itemRoot.components.set(ItemComponent(id: item.id))
-        Self.addGroundingShadows(to: content)
+        Self.prepareContent(content)
         if let ibl = activeImageBasedLight {
             itemRoot.components.set(ImageBasedLightReceiverComponent(imageBasedLight: ibl))
         }
@@ -208,9 +210,7 @@ enum StageLoadError: LocalizedError {
         contentRoot.addChild(itemRoot)
         itemRoot.isEnabled = !item.isHidden
 
-        if isInspectMode {
-            enablePartColliders(record)
-        }
+        refreshTargeting(record)
         if selectedID == item.id {
             attachSelectionIndicator(to: record)
         }
@@ -401,22 +401,79 @@ enum StageLoadError: LocalizedError {
 
     // MARK: - Inspect
 
-    /// On: per-part box colliders (meshes only), root collider off. Off: back to the root collider.
-    func setInspectMode(_ on: Bool) {
-        guard on != isInspectMode else { return }
-        isInspectMode = on
+    /// Hit-testing state for every item.
+    /// - `itemsTargetable == false` (View mode, or fly mode on): no Collision / InputTarget /
+    ///   HoverEffect on any item root or part. Models are invisible to gaze and pinch.
+    /// - Edit (`inspect == false`): one tight root box collider per unlocked item.
+    /// - Inspect: per-part box colliders (meshes only) instead of the root collider.
+    /// Locked layers are never targetable.
+    func setInteraction(inspect: Bool, itemsTargetable targetable: Bool) {
+        guard inspect != isInspectMode || targetable != itemsTargetable else { return }
+        isInspectMode = inspect
+        itemsTargetable = targetable
         for (_, record) in records {
-            if on {
-                enablePartColliders(record)
+            refreshTargeting(record)
+        }
+    }
+
+    /// Part colliders exist only while they can be used (Inspect and targetable). Building them
+    /// walks the model, so this only changes on mode / fly-mode switches, not per item.
+    private var wantsPartColliders: Bool { isInspectMode && itemsTargetable }
+
+    /// Brings one item's Collision / InputTarget / HoverEffect in line with the current state.
+    /// Idempotent; called after any change of mode, fly mode or layer lock.
+    private func refreshTargeting(_ record: ItemRecord) {
+        if wantsPartColliders {
+            enablePartColliders(record)
+        } else {
+            disablePartColliders(record)
+        }
+
+        let root = record.root
+        let targetable = itemsTargetable && !record.isLocked
+        if targetable {
+            // In Inspect the parts carry the colliders; fall back to the root box when the
+            // walk found no meshes, so the item can still be tapped as a whole.
+            if record.partColliders.isEmpty {
+                root.components.set(record.rootCollision)
             } else {
-                disablePartColliders(record)
+                root.components.remove(CollisionComponent.self)
+            }
+            if !root.components.has(InputTargetComponent.self) {
+                root.components.set(InputTargetComponent())
+            }
+            if !root.components.has(HoverEffectComponent.self) {
+                root.components.set(HoverEffectComponent())
+            }
+        } else {
+            root.components.remove(CollisionComponent.self)
+            root.components.remove(InputTargetComponent.self)
+            root.components.remove(HoverEffectComponent.self)
+        }
+
+        for state in record.partColliders {
+            let entity = state.entity
+            if targetable {
+                entity.components.set(state.collision)
+                if !entity.components.has(InputTargetComponent.self) {
+                    entity.components.set(InputTargetComponent())
+                }
+            } else {
+                // Locked layer in Inspect: no input target and no inspect collider on the part.
+                if let original = state.originalCollision {
+                    entity.components.set(original)
+                } else {
+                    entity.components.remove(CollisionComponent.self)
+                }
+                entity.components.remove(InputTargetComponent.self)
             }
         }
     }
 
+    /// Adds per-part box colliders (meshes only). Input targets are set by `refreshTargeting`.
     private func enablePartColliders(_ record: ItemRecord) {
-        guard record.partColliders.isEmpty else { return }
-        record.root.components.remove(CollisionComponent.self)
+        guard !record.partCollidersBuilt else { return }
+        record.partCollidersBuilt = true
 
         var visited = 0
         var stack: [Entity] = Array(record.content.children.reversed())
@@ -435,28 +492,31 @@ enum StageLoadError: LocalizedError {
             }
             guard !b.isEmpty, Self.isFinite(b.extents) else { continue }
 
-            let state = PartColliderState(
-                entity: entity,
-                originalCollision: entity.components[CollisionComponent.self],
-                hadInputTarget: entity.components.has(InputTargetComponent.self),
-                hadHover: entity.components.has(HoverEffectComponent.self)
-            )
             let size = SIMD3<Float>(
                 Swift.max(b.extents.x, Self.minPartCollisionSize),
                 Swift.max(b.extents.y, Self.minPartCollisionSize),
                 Swift.max(b.extents.z, Self.minPartCollisionSize)
             )
             let shape = ShapeResource.generateBox(size: size).offsetBy(translation: b.center)
-            entity.components.set(CollisionComponent(shapes: [shape]))
+            let state = PartColliderState(
+                entity: entity,
+                collision: CollisionComponent(shapes: [shape]),
+                originalCollision: entity.components[CollisionComponent.self],
+                hadHover: entity.components.has(HoverEffectComponent.self)
+            )
+            entity.components.set(state.collision)
             if !state.hadHover {
                 entity.components.set(HoverEffectComponent())
             }
             record.partColliders.append(state)
         }
-        updatePartInputTargets(record)
     }
 
+    /// Restores every part to what it had before `enablePartColliders`. The root's collider is
+    /// handled by `refreshTargeting`.
     private func disablePartColliders(_ record: ItemRecord) {
+        guard record.partCollidersBuilt else { return }
+        record.partCollidersBuilt = false
         for state in record.partColliders {
             let entity = state.entity
             if let original = state.originalCollision {
@@ -464,26 +524,13 @@ enum StageLoadError: LocalizedError {
             } else {
                 entity.components.remove(CollisionComponent.self)
             }
-            if !state.hadInputTarget {
-                entity.components.remove(InputTargetComponent.self)
-            }
+            // File-authored input targets were stripped on load (`prepareContent`).
+            entity.components.remove(InputTargetComponent.self)
             if !state.hadHover {
                 entity.components.remove(HoverEffectComponent.self)
             }
         }
         record.partColliders.removeAll()
-        record.root.components.set(record.rootCollision)
-    }
-
-    /// Locked layers get no InputTarget on their parts (the root's is handled by `applyState`).
-    private func updatePartInputTargets(_ record: ItemRecord) {
-        for state in record.partColliders {
-            if record.isLocked {
-                state.entity.components.remove(InputTargetComponent.self)
-            } else if !state.entity.components.has(InputTargetComponent.self) {
-                state.entity.components.set(InputTargetComponent())
-            }
-        }
     }
 
     /// Path of names from the item's content child down to `entity` ("Building/Floor_2/Wall_12").
@@ -868,12 +915,19 @@ enum StageLoadError: LocalizedError {
         return current
     }
 
-    private static func addGroundingShadows(to entity: Entity) {
-        if entity.components.has(ModelComponent.self) {
-            entity.components.set(GroundingShadowComponent(castsShadow: true))
-        }
-        for child in entity.children {
-            addGroundingShadows(to: child)
+    /// Grounding shadows on every mesh, and no input targets authored in the file (e.g. a
+    /// .reality scene): item hit-testing is owned by `refreshTargeting`, so View mode and
+    /// fly mode can switch it off completely.
+    private static func prepareContent(_ content: Entity) {
+        var stack: [Entity] = [content]
+        while let entity = stack.popLast() {
+            if entity.components.has(ModelComponent.self) {
+                entity.components.set(GroundingShadowComponent(castsShadow: true))
+            }
+            if entity.components.has(InputTargetComponent.self) {
+                entity.components.remove(InputTargetComponent.self)
+            }
+            stack.append(contentsOf: entity.children)
         }
     }
 
@@ -882,14 +936,10 @@ enum StageLoadError: LocalizedError {
         let layerVisible = layer?.isVisible ?? true
         let locked = layer?.isLocked ?? false
         entity.isEnabled = !item.isHidden && layerVisible
-        record.isLocked = locked
-        if locked {
-            entity.components.remove(InputTargetComponent.self)
-        } else if !entity.components.has(InputTargetComponent.self) {
-            entity.components.set(InputTargetComponent())
-        }
-        if isInspectMode {
-            updatePartInputTargets(record)
+        // `addItem` already applied the targeting for "unlocked"; only a change needs a refresh.
+        if record.isLocked != locked {
+            record.isLocked = locked
+            refreshTargeting(record)
         }
     }
 
@@ -914,6 +964,8 @@ enum StageLoadError: LocalizedError {
     let rootCollision: CollisionComponent
     var isLocked = false
     var hiddenParts: Set<String> = []
+    /// Inspect-mode part colliders are in place (may be empty for a model without meshes).
+    var partCollidersBuilt = false
     var partColliders: [PartColliderState] = []
     var inspectionCache: InspectionCache?
     var bottomCache: BottomCache?
@@ -931,8 +983,9 @@ enum StageLoadError: LocalizedError {
 /// What a part entity had before inspect mode added its collider (restored on exit).
 private struct PartColliderState {
     let entity: Entity
+    /// The inspect-mode box collider added to the part.
+    let collision: CollisionComponent
     let originalCollision: CollisionComponent?
-    let hadInputTarget: Bool
     let hadHover: Bool
 }
 

@@ -9,6 +9,7 @@ A private, native visionOS app (SwiftUI + RealityKit + ARKit) for viewing 3D mod
 - **Layers**: visibility and lock per layer, items per layer. Opened from the main panel or from your **left palm** (turn your palm toward your face, then tap "Layers").
 - **Fly mode**: clench **both fists**, then move them in the direction you want to go (forward, back, sideways, up, down). Turn them like a steering wheel to rotate. Open a hand to stop. "Recenter" returns to the start.
 - Gestures on objects: pinch + move = move, two hands = scale, two-hand twist = rotate, tap = select.
+- **View / Edit / Inspect** modes: every project opens in **View** (models locked, so gaze and pinch always reach panels and the palm button); **Edit** moves, scales and rotates; **Inspect** shows details. While Fly mode is on, models are always locked.
 
 ## Supported 3D formats
 

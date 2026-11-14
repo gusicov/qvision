@@ -127,12 +127,17 @@ struct ProjectPanelView: View {
             .pickerStyle(.segmented)
             .labelsHidden()
 
-            Text(model.interactionMode == .edit
-                 ? "Pinch and drag to move. Pinch with both hands to scale, twist to rotate."
-                 : "Nothing moves. Tap a model, or a part of it, to see its details in the Inspector.")
+            Text(model.interactionMode.hint)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if model.isFlyModeEnabled && model.interactionMode != .view {
+                Label("Fly mode is on: models are locked until you turn it off.", systemImage: "airplane")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             if model.interactionMode == .inspect && !model.isInspectorWindowOpen {
                 Button {
