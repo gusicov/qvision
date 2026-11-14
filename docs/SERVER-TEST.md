@@ -6,7 +6,8 @@ QVision's **Server** tab is a NVIDIA CloudXR client (CloudXRKit **6.2.0**, pinne
 - ✅ PC prepared: `tools/cloudxr-lovr-sample` built with CloudXR Runtime **6.2.0**. A smoke run shows the service created and listening on TCP 48010.
 - ✅ Windows Firewall group **"QVision CloudXR"**: TCP 48010, plus UDP 47998, 47999, 48000, 48002, 48005, 48008 and 48012, Private profile, LocalSubnet only. Remove it with `Get-NetFirewallRule -Group "QVision CloudXR" | Remove-NetFirewallRule`.
 - ✅ Desktop shortcut **"CloudXR Test Server"** (`tools/cloudxr-lovr-sample/run-qvision.cmd`; it clears `NoDefaultCurrentDirectoryInExePath` so `run.bat` can find lovr.exe).
-- ⏳ Next: install QVision 0.5 on the headset → Server → My PC `192.168.0.87` → Connect.
+- ✅ **2026-11-14: Phase 1 PASSED on the real headset.** QVision 0.5 (free Apple ID, iloader) → Server → My PC `192.168.0.87` → Connect → LÖVR scene streamed, hand tracking reached the PC, and PC audio streamed to the headset.
+- ⏳ Next: Phase 2, Unreal Engine 5.5.4 + CloudXR (needs the VS 2022 v143 build tools for NVIDIA's UE plugin).
 
 ## Phase 1: Home PC smoke test (no Unreal yet)
 Goal: prove that the headset ↔ PC stream works with NVIDIA's tiny OpenXR test app (LÖVR).
