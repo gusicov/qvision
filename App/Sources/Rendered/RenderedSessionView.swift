@@ -88,6 +88,11 @@ struct RenderedSessionView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
+                if let shading = viewer.shadingSummary {
+                    Text(shading)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Text("Clench both fists and move them to fly; turn them like a steering wheel to rotate. Turn your left palm toward you for Exit, Start position and Speed.")
                     .font(.subheadline)
                     .fixedSize(horizontal: false, vertical: true)

@@ -212,5 +212,118 @@
       ],
       "lens": 22
     }
-  ]
+  ],
+  "hd": {
+    "name": "Casa_SUA_HD",
+    "title": "Casa SUA HD",
+    "tile_bake": {
+      "Floor_Marble_Honed": {
+        "period_m": 2.4,
+        "size": 4096
+      }
+    },
+    "lowres": [
+      "^Lawn$"
+    ],
+    "force_bake": [],
+    "hero": [
+      "^Rug_",
+      "^Art_",
+      "dining_table",
+      "chinese_sofa",
+      "^Sofa_01",
+      "chinese_tea_table",
+      "ClassicConsole",
+      "ornate_mirror"
+    ],
+    "texel_mm": 0.8,
+    "hero_texel_mm": 0.4,
+    "max_size": 4096,
+    "ext_max_size": 1024,
+    "bake_atlas_size": 4096,
+    "bake_atlas_max": 2,
+    "bake_texel_mm": 1.0,
+    "lightmap_size": {
+      "main": 4096,
+      "ext": 2048
+    },
+    "log2_range": [
+      -10.0,
+      5.0
+    ],
+    "albedo_floor": 0.01,
+    "jpeg_quality": 90,
+    "closeups": [
+      {
+        "name": "10_close_rug",
+        "pos": [
+          6.0,
+          13.3,
+          1.2
+        ],
+        "target": [
+          6.35,
+          14.4,
+          0.0
+        ],
+        "lens": 30
+      },
+      {
+        "name": "11_close_painting",
+        "pos": [
+          7.75,
+          4.45,
+          1.55
+        ],
+        "target": [
+          6.74,
+          4.45,
+          1.5
+        ],
+        "lens": 30
+      },
+      {
+        "name": "12_close_table_chairs",
+        "pos": [
+          6.95,
+          11.4,
+          1.4
+        ],
+        "target": [
+          6.0,
+          10.6,
+          0.7
+        ],
+        "lens": 28
+      },
+      {
+        "name": "13_close_sofa_fabric",
+        "pos": [
+          9.8,
+          4.0,
+          1.25
+        ],
+        "target": [
+          10.9,
+          4.7,
+          0.5
+        ],
+        "lens": 28
+      },
+      {
+        "name": "14_close_wardrobe_wood",
+        "pos": [
+          1.3,
+          12.6,
+          1.5
+        ],
+        "target": [
+          1.3,
+          11.46,
+          1.2
+        ],
+        "lens": 28
+      }
+    ]
+  }
 }

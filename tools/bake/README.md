@@ -51,5 +51,36 @@ The `verify` stage needs `--factory-startup`.
 
 - The lighting is fixed (one sun position). Speculars and reflections are not baked: floors look matte and mirrors are grey.
 - Changing the exposure needs only `post` → `export` → `verify`. Changing the sun or lamps needs `bake` again with `--force`.
-- Textures are baked at the lightmap resolution, about 5–7.5 mm per texel indoors. Fine detail in paintings and fabric is softer than in the original textures.
+- In the v1 package, textures are baked at the lightmap resolution, about 5–7.5 mm per texel indoors. Fine detail in paintings and fabric is softer than in the original textures. The HD package below fixes this.
 - Requirements: Blender 5.2 and an NVIDIA GPU (OptiX). An 8 GB card is enough when atlases are baked one at a time.
+
+## HD package (`qv_hd.py`, `Bake-Rendered-HD.cmd`): lighting and albedo split
+
+Run it **after** a finished v1 bake. It reuses the v1 work blend, lightmap UVs and float bakes; no new lighting bake is needed. It writes `<hd.name>.usdz/.json/.jpg` (e.g. `Casa_SUA_HD`) next to the v1 package, plus `previews_hd\`.
+
+```bat
+tools\bake\Bake-Rendered-HD.cmd                      :: hd_prep -> hd_light -> hd_export -> hd_verify
+tools\bake\Bake-Rendered-HD.cmd casa_sua.json hd_light
+```
+
+On the headset the colour is `tone(albedo(UV1) × tint × lightmap(UV0) × exposure)`, computed by a RealityKit MaterialX graph and shown unlit.
+
+| stage | what it does |
+|---|---|
+| `hd_prep` | Copies the work blend to `<name>_hd_work.blend`. Reads each material's base-colour node tree and picks a mode: `const` (colour → white texture × tint); `uv` (the original image on its UV + mapping, resized to about 0.8 mm per texel, 0.4 mm for `hd.hero`); `box` (an image box/flat-projected from position or object coordinates → UV1 computed with Cycles' box formula); `tile` (periodic procedural from `hd.tile_bake` → a seamless tile baked on a plane, world-planar UV1); `bake` (any other procedural → albedo baked into dense atlases on a fresh unwrap, about 1.9 mm); `lowres` (`hd.lowres` → the v1 albedo atlas). Writes UV1 `AlbedoUV` and `work\hd\tex\*`. |
+| `hd_light` | Lightmap = v1 denoised combined ÷ v1 albedo per atlas. Where the albedo is dark, it blends towards blurred C ÷ blurred A, which avoids spikes at mixed texels. Encoded as **log2 RGB 8-bit PNG** (2^-10…2^5, raw data, no alpha, so premultiplication can't break it). Fits the tone curve `x(ax+b)/(x(cx+d)+e)` to the v1 AgX output and reports how closely the HD maths reproduces v1, in 8-bit levels. |
+| `hd_export` | Every HD material has **two** surfaces: `outputs:surface` = UsdPreviewSurface with the v1 baked atlas on `st` (the fallback: Quick Look and other viewers; the app also turns it unlit if RealityKit ignores the graph), and `outputs:mtlx:surface` = the HD graph. One master material `QV_HD_Master` holds the graph; each material `specializes` it and sets only `inputs:Albedo`, `inputs:Lightmap` and `inputs:Tint`. Glass and cut-outs stay as in v1. Packaged with `UsdUtils.CreateNewUsdzPackage` and checked with the usdchecker `ComplianceChecker`. |
+| `hd_verify` | Imports the USDZ and reads the graph constants and inputs **from the file**, then rebuilds the same maths in Blender nodes. Renders the views in both `hd` and `v1` modes, plus close-ups from `hd.closeups`. Writes `previews_hd\sheet.jpg` and `compare_v1_vs_hd.jpg`. |
+
+**Graph** (standard MaterialX 1.38 nodes + one RealityKit node):
+1. `ND_texcoord_vector2` (index 0 / 1) feeds `ND_image_vector3` (lightmap, raw, clamp) and `ND_image_color3` (albedo, `srgb_texture`, periodic).
+2. The lightmap is decoded: `ND_multiply_vector3FA` → `ND_add_vector3FA` → `ND_exp_vector3` → `ND_convert_vector3_color3`.
+3. Albedo × tint × lightmap × exposure use `ND_multiply_color3` and `ND_multiply_color3FA`.
+4. The tone curve uses multiply/add, then `ND_divide_color3` and `ND_clamp_color3FA`.
+5. The result goes into `ND_realitykit_unlit_surfaceshader` with `applyPostProcessToneMap = false`, as in the v1 path.
+
+**UV sets:** `st` = the lightmap UV (also the fallback atlas UV), `st1` = the albedo UV. RealityKit supports two UV sets.
+
+**Config `hd`:** `name`, `title`, `tile_bake {material: {period_m, size}}`, `lowres`, `force_bake`, `hero`, `texel_mm`, `hero_texel_mm`, `max_size`, `ext_max_size`, `bake_atlas_*`, `lightmap_size {main, ext}`, `log2_range`, `albedo_floor`, `fallback_size`, `closeups`.
+
+Known risks: the RealityKit graph can only be tested on the device. If it fails to load, the fallback surface shows the v1 look. The session panel reports `HD shading: N shader-graph materials · M baked`.

@@ -49,6 +49,9 @@ final class RenderedViewer {
     /// Facts about the loaded scene for the session panel ("12.4 × 9.8 × 6.1 m").
     private(set) var sceneSize: SIMD3<Float>? = nil
     private(set) var hasOwnSky = false
+    /// How the materials ended up: "HD shading: 238 shader-graph materials · 12 baked" (nil before loading).
+    /// Shader-graph materials (an HD package's albedo x lightmap graph) are kept; the others become unlit.
+    private(set) var shadingSummary: String? = nil
 
     /// Fist-fly speed multiplier (1...10, R4), remembered across launches.
     var speed: Float = 1 {
@@ -137,6 +140,7 @@ final class RenderedViewer {
         needsPosePlacement = false
         sceneSize = nil
         hasOwnSky = false
+        shadingSummary = nil
         scene = nil
         phase = .idle
     }
@@ -326,6 +330,8 @@ final class RenderedViewer {
         }
 
         var foundSky = false
+        var graphMaterials = 0
+        var bakedMaterials = 0
         let total = all.count
         for (index, entity) in all.enumerated() {
             if !foundSky {
@@ -335,6 +341,9 @@ final class RenderedViewer {
                 }
             }
             if var model = entity.components[ModelComponent.self] {
+                for material in model.materials {
+                    if material is ShaderGraphMaterial { graphMaterials += 1 } else { bakedMaterials += 1 }
+                }
                 model.materials = model.materials.map(Self.unlit)
                 entity.components.set(model)
             }
@@ -350,6 +359,11 @@ final class RenderedViewer {
                 await Task.yield()
                 guard token == loadToken else { return foundSky }
             }
+        }
+        if graphMaterials > 0 {
+            shadingSummary = "HD shading: \(graphMaterials) shader-graph material\(graphMaterials == 1 ? "" : "s") · \(bakedMaterials) baked"
+        } else {
+            shadingSummary = "Baked shading (\(bakedMaterials) material\(bakedMaterials == 1 ? "" : "s"))"
         }
         return foundSky
     }
