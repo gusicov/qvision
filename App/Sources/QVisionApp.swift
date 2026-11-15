@@ -35,7 +35,8 @@ struct QVisionApp: App {
         .defaultWindowPlacement { _, _ in
             WindowPlacement(.utilityPanel)
         }
-        .restorationBehavior(.disabled)
+        // Note: .restorationBehavior(.disabled) needs visionOS 26; on 2.x restored windows
+        // without a project close themselves and reopen Home (see ProjectPanelWindowView / RootView).
 
         // Movable Layers window (system window bar), opened from the panel.
         WindowGroup(id: AppModel.layersWindowID) {
@@ -43,7 +44,6 @@ struct QVisionApp: App {
                 .environment(model)
         }
         .defaultSize(width: 440, height: 620)
-        .restorationBehavior(.disabled)
 
         // Movable Inspector window, opened in Inspect mode.
         WindowGroup(id: AppModel.inspectorWindowID) {
@@ -51,7 +51,6 @@ struct QVisionApp: App {
                 .environment(model)
         }
         .defaultSize(width: 480, height: 680)
-        .restorationBehavior(.disabled)
 
         // The stage. Mixed = your room, Full = generated environment only.
         ImmersiveSpace(id: AppModel.stageSpaceID) {
