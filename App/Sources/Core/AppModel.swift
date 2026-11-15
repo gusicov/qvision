@@ -24,6 +24,13 @@ final class AppModel {
     static let inspectorWindowID = "inspector"
     /// The project panel: a real visionOS window (system move bar), opened from the palm button.
     static let panelWindowID = "panel"
+    /// v0.8: the Rendered viewer (one baked scene, unlit, full immersion).
+    static let renderedSpaceID = "rendered"
+
+    /// The tabs of Home (v0.8 R1).
+    enum HomeTab: String, Hashable {
+        case projects, rendered, server
+    }
 
     static let supportedTypes: [UTType] = {
         var types: [UTType] = [.usdz, .usd, .realityFile]
@@ -233,6 +240,23 @@ final class AppModel {
     @ObservationIgnored let hands: HandTrackingService
     @ObservationIgnored let fly: FlyController
 
+    // MARK: v0.8 state (Rendered mode)
+
+    /// Selected Home tab. Leaving a rendered scene comes back to `.rendered`.
+    var homeTab: HomeTab = .projects
+
+    /// The baked-scene viewer (observable itself: phase, speed).
+    @ObservationIgnored let rendered: RenderedViewer
+    /// The "rendered" ImmersiveSpace, kept in sync by the serialized flow like `stageState`.
+    var renderedState: StageState = .closed
+    /// The scene the rendered space shows; nil = not in Rendered mode.
+    private(set) var currentRenderedScene: RenderedScene? = nil
+    /// The scene id for which RootView already handed off (dismissed) the main window.
+    @ObservationIgnored var renderedHandedOffSceneID: String? = nil
+    /// Server mode, so the flow can end a stream before opening another immersive space
+    /// (only one ImmersiveSpace can be open). Set by RootView.
+    @ObservationIgnored private weak var server: ServerSessionController? = nil
+
     @ObservationIgnored private let store = ProjectStore()
     @ObservationIgnored private var pendingSave: Task<Void, Never>? = nil
 
@@ -249,6 +273,7 @@ final class AppModel {
         self.stage = StageController()
         self.hands = handService
         self.fly = FlyController(hands: handService)
+        self.rendered = RenderedViewer(hands: handService)
         self.projects = store.loadAll()
 
         let stored = UserDefaults.standard.object(forKey: Self.flySpeedDefaultsKey) as? Double
@@ -1091,6 +1116,7 @@ final class AppModel {
         mainDismissExpectedUntil = 0
         guard !expected else { return }
         leaveIfNoWindowRemains()
+        leaveRenderedIfUncontrollable()
     }
 
     func panelWindowDidAppear() {
@@ -1160,6 +1186,9 @@ final class AppModel {
 
     private func performOpen(_ id: UUID) async {
         guard let project = projects.first(where: { $0.id == id }) else { return }
+        // Only one ImmersiveSpace at a time (v0.8): rendered scene and stream go first.
+        await closeRenderedSpace()
+        await endStreamIfNeeded()
 
         // Double tap / already open: just make sure the stage is there.
         if currentProject?.id == id {
@@ -1277,6 +1306,192 @@ final class AppModel {
         // Never leave the state stuck in `.transitioning`.
         if stageState == .transitioning { stageState = .closed }
     }
+
+    // MARK: - Rendered mode flow (v0.8 R4, L6 rules)
+
+    func attach(server: ServerSessionController) {
+        self.server = server
+    }
+
+    /// Opens a rendered scene in the "rendered" ImmersiveSpace (serialized with every other open /
+    /// leave). An open project is saved and closed first, and a server stream is ended, so two
+    /// immersive spaces are never open at once.
+    func requestOpenRendered(_ scene: RenderedScene) {
+        enqueueFlow { [weak self] in
+            await self?.performOpenRendered(scene)
+        }
+    }
+
+    /// Exit: closes the rendered space, releases the scene and shows Home › Rendered.
+    func requestLeaveRendered() {
+        guard currentRenderedScene != nil || renderedState != .closed else { return }
+        enqueueFlow { [weak self] in
+            await self?.performLeaveRendered(toHome: true)
+        }
+    }
+
+    /// Server tab: before connecting, close the stage or the rendered space (serialized).
+    func releaseImmersiveSpacesForStream() async {
+        guard currentRenderedScene != nil || renderedState != .closed
+                || currentProject != nil || stageState != .closed else { return }
+        await enqueueFlow { [weak self] in
+            guard let self else { return }
+            await self.closeRenderedSpace()
+            if self.currentProject != nil || self.stageState != .closed {
+                await self.performLeave(toHome: true)
+            }
+        }.value
+    }
+
+    func renderedDidAppear() {
+        renderedState = .open
+    }
+
+    /// The rendered space went away. If that wasn't our own Exit (Digital Crown, system), the
+    /// scene is released and Home › Rendered is what the main window shows next.
+    func renderedDidDisappear() {
+        renderedState = .closed
+        // A late onDisappear while the flow is already opening the next scene must not release it.
+        if currentRenderedScene == nil || !isTransitioning {
+            rendered.release()
+        }
+        guard !isTransitioning, currentRenderedScene != nil else { return }
+        currentRenderedScene = nil
+        renderedHandedOffSceneID = nil
+        homeTab = .rendered
+    }
+
+    private func performOpenRendered(_ scene: RenderedScene) async {
+        // Already showing it: nothing to do.
+        if currentRenderedScene?.id == scene.id, renderedState == .open {
+            return
+        }
+        // A project (and its windows / stage) closes first; Home stays.
+        if currentProject != nil || stageState != .closed {
+            await performLeave(toHome: true)
+        }
+        await endStreamIfNeeded()
+        // Another rendered scene is open: close it first (one scene in memory at a time).
+        if currentRenderedScene != nil || renderedState != .closed {
+            await closeRenderedSpace()
+        }
+
+        homeTab = .rendered
+        renderedHandedOffSceneID = nil
+        currentRenderedScene = scene
+        rendered.begin(scene)
+        await syncRendered()
+        if currentRenderedScene == nil {
+            rendered.release()
+        }
+    }
+
+    private func performLeaveRendered(toHome: Bool) async {
+        homeTab = .rendered
+        // Home first, so the app always keeps a window while the space closes.
+        if toHome, !isMainWindowOpen, let actions = sceneActions {
+            actions.openWindow(id: Self.mainWindowID)
+        }
+        await closeRenderedSpace()
+    }
+
+    /// Dismisses the rendered space (if open) and releases the scene.
+    private func closeRenderedSpace() async {
+        guard currentRenderedScene != nil || renderedState != .closed else { return }
+        currentRenderedScene = nil
+        renderedHandedOffSceneID = nil
+        await syncRendered()
+        rendered.release()
+    }
+
+    /// Opens / dismisses the rendered space until it matches `currentRenderedScene`. Only called
+    /// from flow operations, so never concurrently.
+    private func syncRendered() async {
+        guard let actions = sceneActions else {
+            if currentRenderedScene != nil {
+                currentRenderedScene = nil
+                lastError = "The rendered view couldn't be opened. Try again."
+            }
+            return
+        }
+        for _ in 0..<12 {
+            let wantsSpace = currentRenderedScene != nil
+            switch (wantsSpace, renderedState) {
+            case (true, .closed):
+                renderedState = .transitioning
+                let result = await actions.openImmersiveSpace(id: Self.renderedSpaceID)
+                switch result {
+                case .opened:
+                    renderedState = .open
+                case .userCancelled:
+                    renderedState = .closed
+                    currentRenderedScene = nil
+                    return
+                case .error:
+                    renderedState = .closed
+                    currentRenderedScene = nil
+                    lastError = "The rendered view couldn't be opened. Close any other immersive view (a project or a server stream) and try again."
+                    return
+                @unknown default:
+                    renderedState = .closed
+                    currentRenderedScene = nil
+                    return
+                }
+
+            case (false, .open):
+                renderedState = .transitioning
+                await actions.dismissImmersiveSpace()
+                renderedState = .closed
+
+            case (_, .transitioning):
+                try? await Task.sleep(nanoseconds: 200_000_000)
+
+            default:
+                return
+            }
+        }
+        if renderedState == .transitioning { renderedState = .closed }
+    }
+
+    /// Ends a server stream (and waits for its space to close) before another space opens.
+    private func endStreamIfNeeded() async {
+        guard let server else { return }
+        let streaming = server.isStreamSpaceOpen || server.wantsStreamSpace
+        switch server.phase {
+        case .connecting, .connected:
+            server.disconnect()
+        default:
+            break
+        }
+        guard streaming || server.isStreamSpaceOpen else { return }
+        // StreamImmersiveView / ServerHomeView dismiss the space once the stream is down.
+        for _ in 0..<30 {
+            if !server.isStreamSpaceOpen { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if server.isStreamSpaceOpen, let actions = sceneActions {
+            await actions.dismissImmersiveSpace()
+            server.isStreamSpaceOpen = false
+        }
+    }
+
+    /// The main window closed while a rendered scene is open. Without hand tracking there is no
+    /// palm menu to leave with, so leave the scene too (the app ends cleanly).
+    private func leaveRenderedIfUncontrollable() {
+        guard currentRenderedScene != nil, !isTransitioning else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard let self,
+                  self.currentRenderedScene != nil,
+                  !self.isTransitioning,
+                  !self.isMainWindowOpen,
+                  self.hands.status != .running else { return }
+            self.enqueueFlow { [weak self] in
+                await self?.performLeaveRendered(toHome: false)
+            }
+        }
+    }
+
 
     // MARK: - Private helpers
 

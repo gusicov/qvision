@@ -7,6 +7,8 @@ struct QVisionApp: App {
     @State private var model = AppModel()
     /// Server mode: NVIDIA CloudXR streaming (Unreal on a PC / the office server).
     @State private var server = ServerSessionController()
+    /// Rendered mode (v0.8): baked scenes on this Vision Pro + the QVision Library on the PC.
+    @State private var library = RenderedLibrary()
 
     init() {
         StageComponents.register()
@@ -21,6 +23,7 @@ struct QVisionApp: App {
             RootView()
                 .environment(model)
                 .environment(server)
+                .environment(library)
         }
         .defaultSize(width: 760, height: 820)
 
@@ -69,6 +72,14 @@ struct QVisionApp: App {
                 .environment(model)
         }
         .immersionStyle(selection: streamImmersionBinding, in: .mixed, .full)
+
+        // Rendered mode (v0.8 R4): one baked, unlit scene at real scale, full immersion.
+        ImmersiveSpace(id: AppModel.renderedSpaceID) {
+            RenderedImmersiveView()
+                .environment(model)
+                .environment(library)
+        }
+        .immersionStyle(selection: .constant(FullImmersionStyle.full as any ImmersionStyle), in: .full)
     }
 
     private var streamImmersionBinding: Binding<any ImmersionStyle> {

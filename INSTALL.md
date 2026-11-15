@@ -17,6 +17,11 @@
    If it asks for **Developer Mode**: **Settings → Privacy & Security → Developer Mode → On** (the headset restarts).
 4. Launch **QVision** from the Home View. It has its own icon.
 
+## Rendered mode: PC library (v0.8, once)
+1. As administrator: `powershell -ExecutionPolicy Bypass -File "C:\All Docs\06_Apple vision pro\qvision\tools\library-server\add-library-firewall.ps1"`. It adds the "QVision Library (TCP 8770)" rule (Private, LocalSubnet) to the "QVision CloudXR" group. Your Wi-Fi/Ethernet network must be set to **Private**.
+2. Start **Desktop › Vision Pro › QVision Library (PC)** whenever you want to download scenes. It prints the address to type on the headset.
+3. The first time QVision talks to the PC, visionOS asks to allow **Local Network**: allow it.
+
 ## Every 7 days
 A free Apple ID's certificate expires after 7 days. The app stops opening, but its data stays.
 To fix it: in iloader, sideload the same IPA again (or a newer one).

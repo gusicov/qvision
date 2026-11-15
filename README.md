@@ -11,6 +11,30 @@ A private, native visionOS app (SwiftUI + RealityKit + ARKit) for viewing 3D mod
 - Gestures on objects: pinch + move = move, two hands = scale, two-hand twist = rotate, tap = select.
 - **View / Edit / Inspect** modes: every project opens in **View** (models locked, so gaze and pinch always reach panels and the palm button); **Edit** moves, scales and rotates; **Inspect** shows details. While Fly mode is on, models are always locked.
 
+## Three ways to view a model (v0.8)
+
+| Home tab | What | Lighting | Runs on |
+|---|---|---|---|
+| **Projects** | arrange and edit any USDZ | real-time (IBL + shadows) | headset |
+| **Rendered** | walk through one photoreal pre-lit scene | baked into the textures, shown unlit | headset, offline once downloaded |
+| **Server** | Unreal stream via NVIDIA CloudXR | live on the PC | PC / office server |
+
+### Rendered mode
+A *Rendered package* is `<Name>.usdz` (Y-up, metres, final lit colour baked into the base-colour textures) plus an optional `<Name>.json` sidecar (`title`, `start.position` = floor point for your feet, `start.yawDegrees` = view direction, 0 = along -Z, 90 = along -X) and an optional `<Name>.jpg` thumbnail. QVision shows every material unlit with no extra lights, so what you see is exactly the bake, at 90 fps. Client models never go into this repo or the IPA: they stay on the PC in `assets\Rendered\` and are downloaded over the LAN.
+
+**Start the QVision Library on the PC**
+1. First time only, as administrator: `powershell -ExecutionPolicy Bypass -File tools\library-server\add-library-firewall.ps1` (Private profile, LocalSubnet, TCP 8770).
+2. Double-click **Desktop › Vision Pro › QVision Library (PC)**. The window shows the PC's address (e.g. `192.168.0.87`) and logs every request. Keep it open while downloading.
+   (It runs `tools\library-server\qvision_library.py`: Python 3 stdlib, port 8770, LAN clients only, serves `C:\All Docs\06_Apple vision pro\assets\Rendered`.)
+
+**On the headset**
+1. Home › **Rendered** › *On my PC*: the address comes from your saved "My PC" server (edit it if needed) → **Connect**.
+2. **Download** (progress bar, Cancel). The scene moves to *On this Vision Pro* and works offline. A failed or cancelled download leaves nothing behind. Delete frees the space.
+3. Tap the scene to open it (full immersion). You stand at the start position. Clench both fists to fly (1×–10×). Turn your **left palm** toward you for **Exit · Start · Speed**. Exit returns to Home › Rendered.
+4. *Import from Files* takes a `.usdz` (select its `.json` and `.jpg` together with it) for packages that arrive another way.
+
+Budget per scene: about 1.5 M triangles, at most eight 4096² atlases, USDZ up to about 500 MB.
+
 ## Supported 3D formats
 
 | Format | Status | Notes |

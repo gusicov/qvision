@@ -12,6 +12,8 @@ import SwiftUI
 /// and the reason shown.
 struct ServerHomeView: View {
     @Environment(ServerSessionController.self) private var server
+    /// v0.8: a project stage or a rendered scene is closed before a stream opens (one space at a time).
+    @Environment(AppModel.self) private var model
     @Environment(\.openImmersiveSpace) private var openImmersiveSpace
     @Environment(\.dismissImmersiveSpace) private var dismissImmersiveSpace
 
@@ -212,7 +214,10 @@ struct ServerHomeView: View {
                     HStack(spacing: 12) {
                         if server.activeServer != nil {
                             Button {
-                                Task { await server.retry() }
+                                Task {
+                                    await model.releaseImmersiveSpacesForStream()
+                                    await server.retry()
+                                }
                             } label: {
                                 Label("Retry", systemImage: "arrow.clockwise")
                             }
@@ -287,7 +292,10 @@ struct ServerHomeView: View {
                 ProgressView()
             } else {
                 Button("Connect") {
-                    Task { await server.connect(to: item.id) }
+                    Task {
+                        await model.releaseImmersiveSpacesForStream()
+                        await server.connect(to: item.id)
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(isBusy)
@@ -409,7 +417,7 @@ struct ServerHomeView: View {
                 case .userCancelled:
                     server.disconnect(withError: "The stream view was cancelled, so the stream was stopped.")
                 case .error:
-                    server.disconnect(withError: "Couldn't open the stream view. Close any other immersive scene (an open project) and try again.")
+                    server.disconnect(withError: "Couldn't open the stream view. Close any other immersive scene (an open project or a rendered scene) and try again.")
                 @unknown default:
                     server.disconnect(withError: "Couldn't open the stream view.")
                 }

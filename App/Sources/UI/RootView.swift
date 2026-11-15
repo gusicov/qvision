@@ -11,6 +11,7 @@ import SwiftUI
 /// RootView only presents the file picker for "Import models" (requested by the panel).
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(ServerSessionController.self) private var server
     @Environment(\.dismissWindow) private var dismissWindow
     @Environment(\.openWindow) private var openWindow
 
@@ -31,17 +32,45 @@ struct RootView: View {
         )
     }
 
+    /// v0.8: rendered scene open + ready + hand tracking running -> the palm menu takes over.
+    private struct RenderedHandoffTrigger: Equatable {
+        let sceneID: String?
+        let spaceOpen: Bool
+        let ready: Bool
+        let handsRunning: Bool
+    }
+
+    private var renderedHandoffTrigger: RenderedHandoffTrigger {
+        RenderedHandoffTrigger(
+            sceneID: model.currentRenderedScene?.id,
+            spaceOpen: model.renderedState == .open,
+            ready: model.rendered.isReady,
+            handsRunning: model.hands.status == .running
+        )
+    }
+
+    private var tabBinding: Binding<AppModel.HomeTab> {
+        Binding(get: { model.homeTab }, set: { model.homeTab = $0 })
+    }
+
     var body: some View {
         ZStack {
-            if model.currentProject == nil {
-                TabView {
+            if model.currentProject != nil {
+                ProjectPanelView(context: .window)
+            } else if model.currentRenderedScene != nil {
+                RenderedSessionView()
+            } else {
+                TabView(selection: tabBinding) {
                     ProjectsHomeView()
                         .tabItem { Label("Projects", systemImage: "square.stack.3d.up") }
+                        .tag(AppModel.HomeTab.projects)
+                    RenderedHomeView()
+                        .tabItem { Label("Rendered", systemImage: "sparkles") }
+                        .tag(AppModel.HomeTab.rendered)
                     ServerHomeView()
                         .tabItem { Label("Server", systemImage: "server.rack") }
+                        .tag(AppModel.HomeTab.server)
                 }
-            } else {
-                ProjectPanelView(context: .window)
             }
 
             // Project opening (the import progress shows inside the panel instead).
@@ -51,6 +80,7 @@ struct RootView: View {
         }
         .installsSceneActions()
         .onAppear {
+            model.attach(server: server)
             model.mainWindowDidAppear()
         }
         .onDisappear {
@@ -58,6 +88,9 @@ struct RootView: View {
         }
         .onChange(of: handoffTrigger, initial: true) { _, trigger in
             handOffToPanelWindowIfReady(trigger)
+        }
+        .onChange(of: renderedHandoffTrigger, initial: true) { _, trigger in
+            handOffToRenderedSpaceIfReady(trigger)
         }
         .onChange(of: model.isImportPickerRequested, initial: true) { _, requested in
             guard requested else { return }
@@ -110,6 +143,25 @@ struct RootView: View {
         }
         model.noteMainWindowDismissRequested()
         dismissWindow(id: AppModel.mainWindowID)
+    }
+
+    /// Rendered mode: once the scene is shown and the palm menu works, close the main window
+    /// (once per scene open), like the project handoff. Exit reopens it at Home › Rendered.
+    private func handOffToRenderedSpaceIfReady(_ trigger: RenderedHandoffTrigger) {
+        guard let sceneID = trigger.sceneID,
+              trigger.spaceOpen, trigger.ready, trigger.handsRunning,
+              model.currentProject == nil,
+              model.renderedHandedOffSceneID != sceneID else { return }
+        model.renderedHandedOffSceneID = sceneID
+        Task { @MainActor in
+            // Let the user see "ready" for a moment.
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard model.currentRenderedScene?.id == sceneID,
+                  model.rendered.isReady,
+                  model.hands.status == .running else { return }
+            model.noteMainWindowDismissRequested()
+            dismissWindow(id: AppModel.mainWindowID)
+        }
     }
 
     /// The main window was (re)opened to present the file picker for the panel window. Once the

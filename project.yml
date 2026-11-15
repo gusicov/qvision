@@ -16,8 +16,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.7.0"
-    CURRENT_PROJECT_VERSION: "8"
+    MARKETING_VERSION: "0.8.0"
+    CURRENT_PROJECT_VERSION: "9"
 
 targets:
   QVision:
@@ -50,7 +50,10 @@ targets:
         # headset ("On My Apple Vision Pro › QVision").
         NSHandsTrackingUsageDescription: QVision uses hand tracking for fly mode (clench both fists to move) and for the palm Layers menu.
         NSWorldSensingUsageDescription: QVision uses world tracking to place models in front of you.
-        NSLocalNetworkUsageDescription: QVision connects to your PC or office server on the local network to stream Unreal Engine scenes (NVIDIA CloudXR).
+        NSLocalNetworkUsageDescription: QVision connects to your PC or office server on the local network to stream Unreal Engine scenes (NVIDIA CloudXR) and to download rendered scenes from the QVision Library.
+        # v0.8: plain HTTP to the QVision Library on the PC (LAN only, port 8770).
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:

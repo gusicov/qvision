@@ -38,6 +38,17 @@ enum EnvironmentBuilder {
         return await makeProcedural(preset, look: look)
     }
 
+    /// v0.8 Rendered viewer: only the sky dome of `preset` (baked equirect sky, procedural gradient
+    /// as fallback), unlit, no floor and no lights. Radius `skyRadius` at scale [-1, 1, 1]; the
+    /// caller scales it and keeps it centred on the head.
+    @MainActor static func makeSkyOnly(_ preset: EnvironmentPreset) async -> Entity {
+        let look = Look.forPreset(preset)
+        if let sky = await loadTexture(look.sky, ext: "jpg", semantic: .color) {
+            return makeBakedSky(sky, look: look)
+        }
+        return await makeSkyDome(Palette.forPreset(preset, look: look))
+    }
+
     // MARK: - Look (baked resources + lighting per preset)
 
     private struct FloorTextures {
