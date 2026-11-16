@@ -30,6 +30,16 @@ final class RenderedViewer {
         case failed(String)
     }
 
+    /// A place to stand: the sidecar start, a named viewpoint, or where the user was last time.
+    /// `point` and `yaw` (radians) are in placement space (= the scene's parent space).
+    struct Viewpoint: Identifiable, Equatable {
+        let id: Int
+        let name: String
+        let point: SIMD3<Float>
+        let yaw: Float
+        let atEyeHeight: Bool
+    }
+
     static let speedRange: ClosedRange<Float> = 1...10
     private static let speedKey = "qvision.renderedFlySpeed"
 
@@ -52,6 +62,10 @@ final class RenderedViewer {
     /// How the materials ended up: "HD shading: 238 shader-graph materials · 12 baked" (nil before loading).
     /// Shader-graph materials (an HD package's albedo x lightmap graph) are kept; the others become unlit.
     private(set) var shadingSummary: String? = nil
+    /// v0.9 D2: places to jump to. Index 0 is always "Start".
+    private(set) var viewpoints: [Viewpoint] = []
+    /// v0.9 B3: the scene opened where the user left it last time (Start is one tap away).
+    private(set) var resumedLastPosition = false
 
     /// Fist-fly speed multiplier (1...10, R4), remembered across launches.
     var speed: Float = 1 {
@@ -82,6 +96,14 @@ final class RenderedViewer {
     @ObservationIgnored private var startAtEyeHeight = false
     /// The placement was made without a head pose: redo it once the first pose arrives.
     @ObservationIgnored private var needsPosePlacement = false
+    /// Where the scene is placed right now (for the redo above).
+    @ObservationIgnored private var currentTarget: Viewpoint? = nil
+    @ObservationIgnored private var fadeTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var fadeOpacity: Float = 1
+    /// Last-position bookkeeping (B3).
+    @ObservationIgnored private var poseSaveClock: Float = 0
+    @ObservationIgnored private var lastSavedPose: SIMD4<Float>? = nil
+    @ObservationIgnored private var sceneBounds: BoundingBox? = nil
     @ObservationIgnored private var lastHeadWorld: SIMD3<Float>? = nil
     /// Mirror of `phase == .ready` for the per-frame update (not observed).
     @ObservationIgnored private var frameReady = false
@@ -113,22 +135,31 @@ final class RenderedViewer {
 
     /// Starts loading `scene` (releases whatever was loaded before).
     func begin(_ scene: RenderedScene) {
+        // A load that is still inside RealityKit can't be cancelled; wait for it to finish (it
+        // is dropped right away) so two scenes are never in memory at once.
+        let previous = loadTask
         release()
         self.scene = scene
         loadToken += 1
         let token = loadToken
         phase = .loading("Opening “\(scene.title)” (\(RenderedFiles.byteText(scene.sizeBytes)))…", nil)
         loadTask = Task { @MainActor [weak self] in
-            await self?.load(scene, token: token)
+            await previous?.value
+            guard let self, token == self.loadToken else { return }
+            await self.load(scene, token: token)
         }
     }
 
     /// Removes the scene and the sky, stops fly mode, cancels a running load. After this
     /// nothing of the scene is referenced, so RealityKit frees its meshes and textures.
     func release() {
+        if frameReady { saveLastPose(force: true) }
         loadToken += 1
         loadTask?.cancel()
-        loadTask = nil
+        // `loadTask` is kept: `begin` waits for it before loading the next scene.
+        fadeTask?.cancel()
+        fadeTask = nil
+        clearFade()
         frameReady = false
         fly.isEnabled = false
         fly.resetOffset(worldRoot: worldRoot)
@@ -141,8 +172,15 @@ final class RenderedViewer {
         sceneSize = nil
         hasOwnSky = false
         shadingSummary = nil
+        viewpoints = []
+        resumedLastPosition = false
+        currentTarget = nil
+        lastSavedPose = nil
+        sceneBounds = nil
         scene = nil
         phase = .idle
+        // The sky texture (shared cache) goes too: nothing of the scene stays in memory.
+        EnvironmentBuilder.purgeCaches()
     }
 
     private func load(_ scene: RenderedScene, token: Int) async {
@@ -191,6 +229,7 @@ final class RenderedViewer {
             return
         }
         sceneSize = bounds.extents
+        sceneBounds = bounds
 
         // Start point + yaw (sidecar in USDZ coordinates -> placement space via the root transform).
         let rootMatrix = loaded.transform.matrix
@@ -231,8 +270,31 @@ final class RenderedViewer {
             sky = dome
         }
 
+        // Viewpoints (D2): Start first, then the sidecar's named places.
+        var places = [Viewpoint(id: 0, name: "Start", point: startPoint, yaw: startYaw, atEyeHeight: startAtEyeHeight)]
+        for (index, viewpoint) in (sidecar?.usableViewpoints ?? []).enumerated() {
+            let p = rootMatrix * SIMD4<Float>(viewpoint.position.x, viewpoint.position.y, viewpoint.position.z, 1)
+            let yaw = viewpoint.yawDegrees * .pi / 180
+            let f = rootMatrix * SIMD4<Float>(-sin(yaw), 0, -cos(yaw), 0)
+            let mappedYaw = simd_length(SIMD2<Float>(f.x, f.z)) > 1e-5 ? atan2(-f.x, -f.z) : yaw
+            let point = SIMD3<Float>(p.x, p.y, p.z)
+            guard Self.isFinite(point) else { continue }
+            places.append(Viewpoint(id: index + 1, name: viewpoint.name, point: point, yaw: mappedYaw,
+                                    atEyeHeight: startAtEyeHeight))
+        }
+        viewpoints = places
+
+        // B3: come back where the user was last time, if that is somewhere else than Start.
+        var initial = places[0]
+        resumedLastPosition = false
+        if let last = Self.loadLastPose(sceneID: scene.id, bounds: bounds, atEyeHeight: startAtEyeHeight),
+           simd_distance(last.point, startPoint) > 0.5 {
+            initial = last
+            resumedLastPosition = true
+        }
+
         content = loaded
-        placeAtStart(devicePose: hands.devicePose())
+        place(initial, devicePose: hands.devicePose())
         placement.addChild(loaded)
         updateSky()
 
@@ -250,17 +312,91 @@ final class RenderedViewer {
 
     // MARK: - Controls
 
-    /// Back to the start position: fly offset cleared, start point under the feet again (wherever
-    /// the user physically stands now), facing the start direction.
+    /// Back to the start position (with the short fade).
     func resetToStart() {
-        guard content != nil else { return }
-        fly.resetOffset(worldRoot: worldRoot)
-        placeAtStart(devicePose: hands.devicePose())
-        updateSky()
+        guard let start = viewpoints.first else { return }
+        go(to: start)
+    }
+
+    /// Moves the user to `viewpoint`: fade out, re-place the scene so that point is under the
+    /// feet (wherever the user physically stands now), fade in. No sliding motion (comfort).
+    func go(to viewpoint: Viewpoint) {
+        guard content != nil, frameReady else { return }
+        fadeTask?.cancel()
+        fadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.fade(to: 0, seconds: 0.16)
+            guard !Task.isCancelled, self.frameReady else { return }
+            self.fly.resetOffset(worldRoot: self.worldRoot)
+            self.place(viewpoint, devicePose: self.hands.devicePose())
+            self.updateSky()
+            self.resumedLastPosition = false
+            await self.fade(to: 1, seconds: 0.22)
+            guard !Task.isCancelled else { return }
+            self.clearFade()
+        }
     }
 
     func changeSpeed(by delta: Float) {
         speed = Self.clampSpeed((speed + delta).rounded())
+    }
+
+    private func fade(to target: Float, seconds: Double) async {
+        let steps = 8
+        let from = fadeOpacity
+        for step in 1...steps {
+            if Task.isCancelled { return }
+            fadeOpacity = from + (target - from) * Float(step) / Float(steps)
+            root.components.set(OpacityComponent(opacity: fadeOpacity))
+            try? await Task.sleep(nanoseconds: UInt64(seconds / Double(steps) * 1_000_000_000))
+        }
+    }
+
+    private func clearFade() {
+        fadeOpacity = 1
+        root.components.remove(OpacityComponent.self)
+    }
+
+    // MARK: - Last position (B3)
+
+    private static func lastPoseKey(_ sceneID: String) -> String {
+        "rendered.lastPose." + sceneID
+    }
+
+    static func forgetLastPose(sceneID: String) {
+        UserDefaults.standard.removeObject(forKey: lastPoseKey(sceneID))
+    }
+
+    private static func loadLastPose(sceneID: String, bounds: BoundingBox, atEyeHeight: Bool) -> Viewpoint? {
+        guard let values = UserDefaults.standard.array(forKey: lastPoseKey(sceneID)) as? [Double], values.count == 4 else { return nil }
+        let point = SIMD3<Float>(Float(values[0]), Float(values[1]), Float(values[2]))
+        let yaw = Float(values[3])
+        guard isFinite(point), yaw.isFinite else { return nil }
+        // Ignore a position far outside the scene (the file may have been replaced).
+        let margin = SIMD3<Float>(repeating: 60)
+        let low = bounds.min - margin
+        let high = bounds.max + margin
+        guard point.x >= low.x, point.y >= low.y, point.z >= low.z,
+              point.x <= high.x, point.y <= high.y, point.z <= high.z else { return nil }
+        return Viewpoint(id: -1, name: "Last position", point: point, yaw: yaw, atEyeHeight: atEyeHeight)
+    }
+
+    /// Stores where the user stands in the scene (placement space) and where they look.
+    private func saveLastPose(force: Bool) {
+        guard let scene, content != nil, let pose = hands.devicePose() else { return }
+        let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
+        let forward = -SIMD3<Float>(pose.columns.2.x, 0, pose.columns.2.z)
+        guard Self.isFinite(head), simd_length(forward) > 0.05 else { return }
+        let standing = SIMD3<Float>(head.x, startAtEyeHeight ? head.y : 0, head.z)
+        let point = placement.convert(position: standing, from: nil)
+        let direction = placement.convert(direction: forward, from: nil)
+        guard Self.isFinite(point), simd_length(SIMD2<Float>(direction.x, direction.z)) > 1e-4 else { return }
+        let yaw = atan2(-direction.x, -direction.z)
+        let value = SIMD4<Float>(point.x, point.y, point.z, yaw)
+        if !force, let last = lastSavedPose, simd_distance(last, value) < 0.15 { return }
+        lastSavedPose = value
+        UserDefaults.standard.set([Double(point.x), Double(point.y), Double(point.z), Double(yaw)],
+                                  forKey: Self.lastPoseKey(scene.id))
     }
 
     // MARK: - Per frame
@@ -271,20 +407,28 @@ final class RenderedViewer {
         if let pose = devicePose {
             let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
             if Self.isFinite(head) { lastHeadWorld = head }
-            if needsPosePlacement && !fly.isFlying {
+            if needsPosePlacement && !fly.isFlying, let target = currentTarget {
                 needsPosePlacement = false
                 fly.resetOffset(worldRoot: worldRoot)
-                placeAtStart(devicePose: pose)
+                place(target, devicePose: pose)
             }
         }
         fly.update(deltaTime: deltaTime, worldRoot: worldRoot)
         updateSky()
+
+        // Remember where the user is every couple of seconds (survives a crash or a force quit).
+        poseSaveClock += deltaTime
+        if poseSaveClock > 2, !fly.isFlying, fadeTask == nil || fadeOpacity >= 1 {
+            poseSaveClock = 0
+            saveLastPose(force: false)
+        }
     }
 
     // MARK: - Private
 
-    /// placement = T(target) · R_y(headYaw − startYaw) · T(−startPoint), with worldRoot at identity.
-    private func placeAtStart(devicePose: simd_float4x4?) {
+    /// placement = T(target) · R_y(headYaw − yaw) · T(−point), with worldRoot at identity.
+    private func place(_ viewpoint: Viewpoint, devicePose: simd_float4x4?) {
+        currentTarget = viewpoint
         var target = SIMD3<Float>(0, 0, 0)
         var headYaw: Float = 0
         if let pose = devicePose {
@@ -292,21 +436,21 @@ final class RenderedViewer {
             let forward = -SIMD3<Float>(pose.columns.2.x, pose.columns.2.y, pose.columns.2.z)
             if Self.isFinite(head) {
                 // The ImmersiveSpace origin is on the floor: feet = head projected to y = 0.
-                target = SIMD3<Float>(head.x, startAtEyeHeight ? head.y : 0, head.z)
+                target = SIMD3<Float>(head.x, viewpoint.atEyeHeight ? head.y : 0, head.z)
             }
             if simd_length(SIMD2<Float>(forward.x, forward.z)) > 0.05 {
                 headYaw = atan2(-forward.x, -forward.z)
             }
             needsPosePlacement = false
         } else {
-            target = SIMD3<Float>(0, startAtEyeHeight ? 1.6 : 0, 0)
+            target = SIMD3<Float>(0, viewpoint.atEyeHeight ? 1.6 : 0, 0)
             needsPosePlacement = true
         }
-        let rotation = simd_quatf(angle: headYaw - startYaw, axis: SIMD3<Float>(0, 1, 0))
+        let rotation = simd_quatf(angle: headYaw - viewpoint.yaw, axis: SIMD3<Float>(0, 1, 0))
         placement.transform = Transform(
             scale: SIMD3<Float>(1, 1, 1),
             rotation: rotation,
-            translation: target - rotation.act(startPoint)
+            translation: target - rotation.act(viewpoint.point)
         )
     }
 

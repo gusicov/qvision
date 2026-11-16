@@ -82,7 +82,7 @@ struct Breadcrumb: View {
             ForEach(Array(components.enumerated()), id: \.offset) { index, name in
                 if index > 0 {
                     Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
+                        .font(.footnote.weight(.bold))
                         .foregroundStyle(.tertiary)
                         .accessibilityHidden(true)
                 }
@@ -261,11 +261,51 @@ struct InfoPill: View {
                 Text(text)
             }
         }
-        .font(.caption.weight(.semibold))
+        .font(.footnote.weight(.semibold))
         .lineLimit(1)
         .foregroundStyle(tint ?? .secondary)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
         .background(.thinMaterial, in: Capsule())
+    }
+}
+
+// MARK: - v0.9 G: shared pieces for every Home tab
+
+extension View {
+    /// Label of a primary action (Open, Download, Connect, New Project): headline text, at least
+    /// 60 pt tall. `expands`: take the full width of the container.
+    func primaryActionLabel(expands: Bool = true) -> some View {
+        self
+            .font(.headline)
+            .lineLimit(1)
+            .frame(maxWidth: expands ? .infinity : nil, minHeight: 60)
+            .padding(.horizontal, expands ? 0 : 10)
+    }
+}
+
+/// The empty state used on every screen: what is missing and what to do next.
+struct EmptyStateCard: View {
+    let systemImage: String
+    let title: String
+    let message: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 16) {
+            Image(systemName: systemImage)
+                .font(.title)
+                .foregroundStyle(Brand.gradient)
+                .frame(width: 44)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(.headline)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .qvCard()
     }
 }

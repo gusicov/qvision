@@ -86,7 +86,7 @@ struct LayersPanelView: View {
             if isExpanded {
                 if items.isEmpty {
                     Text("No objects on this layer")
-                        .font(.caption)
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
                         .padding(.leading, 56)
                         .frame(minHeight: 36)

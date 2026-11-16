@@ -49,6 +49,8 @@ enum StageLoadError: LocalizedError {
     private var environments: [EnvironmentPreset: Entity] = [:]
     private var buildingPresets: Set<EnvironmentPreset> = []
     private var environmentGeneration = 0
+    /// Bumped by `releaseEnvironments`: a build that finishes afterwards is dropped.
+    private var environmentEpoch = 0
     private var requestedPreset: EnvironmentPreset = .studio
     private var requestedMode: ViewMode = .mixed
     private weak var shownEnvironment: Entity?
@@ -877,10 +879,11 @@ enum StageLoadError: LocalizedError {
         guard mode == .full, environments[preset] == nil, !buildingPresets.contains(preset) else { return }
         buildingPresets.insert(preset)
         let generation = environmentGeneration
+        let epoch = environmentEpoch
 
         Task { [weak self] in
             let environment = await EnvironmentBuilder.make(preset)
-            guard let self else { return }
+            guard let self, epoch == self.environmentEpoch else { return }
             self.buildingPresets.remove(preset)
             environment.isEnabled = false
             self.environments[preset] = environment
@@ -889,6 +892,24 @@ enum StageLoadError: LocalizedError {
             guard generation == self.environmentGeneration || self.requestedPreset == preset else { return }
             self.applyEnvironmentState()
         }
+    }
+
+    /// v0.9 (audit M1): removes every built environment (sky, floors, IBL, sun) and the shared
+    /// texture caches. Called when the project closes; the next project rebuilds what it shows.
+    func releaseEnvironments() {
+        environmentGeneration += 1
+        environmentEpoch += 1
+        for (_, environment) in environments {
+            environment.removeFromParent()
+        }
+        environments.removeAll()
+        buildingPresets.removeAll()
+        followPartsCache.removeAll()
+        shownEnvironment = nil
+        activeImageBasedLight = nil
+        requestedMode = .mixed
+        worldRoot.components.remove(ImageBasedLightReceiverComponent.self)
+        EnvironmentBuilder.purgeCaches()
     }
 
     /// Shows the requested environment (only in `.full`) and wires image-based lighting to it.

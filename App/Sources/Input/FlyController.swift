@@ -26,6 +26,17 @@ import simd
 
     private(set) var isFlying: Bool = false
 
+    /// Current smoothed speed (m/s) and turn rate (rad/s): drive the comfort vignette (v0.9 D4).
+    var currentSpeed: Float { simd_length(velocity) }
+    var currentYawRate: Float { abs(yawRate) }
+
+    /// v0.9 D3: the three speed presets shown in every mode.
+    static let speedPresets: [(name: String, systemImage: String, value: Float)] = [
+        ("Walk", "figure.walk", 1),
+        ("Fast", "hare", 3),
+        ("Fly", "airplane", 10)
+    ]
+
     /// true while flying and for `releaseGuard` seconds after the grab ends. Gesture handlers
     /// use it to ignore the system pinch that clenched / opening fists produce.
     var isFlyingOrJustReleased: Bool {

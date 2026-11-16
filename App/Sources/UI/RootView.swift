@@ -70,6 +70,9 @@ struct RootView: View {
                     ServerHomeView()
                         .tabItem { Label("Server", systemImage: "server.rack") }
                         .tag(AppModel.HomeTab.server)
+                    SettingsView()
+                        .tabItem { Label("Settings", systemImage: "gearshape") }
+                        .tag(AppModel.HomeTab.settings)
                 }
             }
 
@@ -199,6 +202,14 @@ struct RootView: View {
                 .controlSize(.large)
             Text("Opening \(model.currentProject?.name ?? "project")…")
                 .font(.headline)
+            // v0.9 B4: never a dead end, a big model can be abandoned.
+            Button {
+                model.requestLeave()
+            } label: {
+                Label("Cancel", systemImage: "xmark")
+                    .primaryActionLabel(expands: false)
+            }
+            .buttonStyle(.bordered)
         }
         .padding(32)
         .glassBackgroundEffect()

@@ -953,6 +953,7 @@ def stage_hd_export(a, cfg):
         'start': {'position': [round(v, 3) for v in Q.blender_to_usd(p)], 'yawDegrees': round(yaw, 1) + 0.0},
         'eyeHeightIncluded': False, 'hasSky': bool(cfg.get('has_sky', False)),
         'shading': 'hd-lightmap',
+        'viewpoints': Q.sidecar_viewpoints(cfg),
         'notes': ('HD: albedo (original textures, UV1 "st1") x baked lightmap (UV0 "st", log2 RGB 2^%g..2^%g) x exposure %.3f, '
                   'tone curve x(ax+b)/(x(cx+d)+e) a..e=%s fitted to AgX "%s"; RealityKit MaterialX graph '
                   '(ND_realitykit_unlit_surfaceshader, no post tone map). Fallback outputs:surface = the v1 baked atlas on st. '

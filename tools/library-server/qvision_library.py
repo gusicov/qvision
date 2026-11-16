@@ -13,6 +13,9 @@ GET /index.json    -> [{ "id", "title", "file", "sizeBytes", "modified", "thumbn
                       ".png" its thumbnail.
 GET /files/<name>  -> streams one file of that folder (usdz, json, jpg/jpeg/png) with Content-Length.
                       Names are matched against the folder listing, so no path can escape it.
+                      Supports a single "Range: bytes=N-" / "bytes=N-M" / "bytes=-N" (206), so an
+                      interrupted download can resume.
+GET /health        -> { "name": "QVision Library", "version": 2, "scenes": N }
 GET /              -> short plain-text status page.
 
 Only clients with a private / loopback / link-local address are served (LAN only); everyone
@@ -37,6 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_FOLDER = r"C:\All Docs\06_Apple vision pro\assets\Rendered"
 DEFAULT_PORT = 8770
+LIBRARY_VERSION = 2
 CHUNK = 1024 * 1024  # 1 MiB per write while streaming
 
 SERVED_TYPES = {
@@ -122,6 +126,8 @@ def build_index(folder: str) -> list[dict]:
             data = read_sidecar(os.path.join(folder, sidecar_name))
             if data and isinstance(data.get("title"), str) and data["title"].strip():
                 entry["title"] = data["title"].strip()
+            if data and isinstance(data.get("shading"), str):
+                entry["shading"] = data["shading"]
         for thumb_ext in THUMBNAIL_EXTS:
             thumb_name = files.get((stem + thumb_ext).lower())
             if thumb_name:
@@ -157,7 +163,7 @@ def resolve_served_file(folder: str, raw_name: str) -> str | None:
 
 
 class LibraryHandler(BaseHTTPRequestHandler):
-    server_version = "QVisionLibrary/1.0"
+    server_version = "QVisionLibrary/2.0"
     protocol_version = "HTTP/1.1"
     folder: str = DEFAULT_FOLDER
 
@@ -204,10 +210,17 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 "QVision Library",
                 f"Folder: {self.folder}",
                 f"Scenes: {len(build_index(self.folder))}",
-                "GET /index.json, GET /files/<name>",
+                "GET /health, GET /index.json, GET /files/<name> (Range supported)",
             ]
             self._send_bytes(HTTPStatus.OK, ("\n".join(lines) + "\n").encode("utf-8"),
                              "text/plain; charset=utf-8", head_only)
+            self._log(HTTPStatus.OK)
+            return
+
+        if path == "/health":
+            scenes = sum(1 for name in folder_files(self.folder) if name.endswith(".usdz"))
+            body = json.dumps({"name": "QVision Library", "version": LIBRARY_VERSION, "scenes": scenes}).encode("utf-8")
+            self._send_bytes(HTTPStatus.OK, body, "application/json; charset=utf-8", head_only)
             self._log(HTTPStatus.OK)
             return
 
@@ -228,6 +241,33 @@ class LibraryHandler(BaseHTTPRequestHandler):
 
         self._error(HTTPStatus.NOT_FOUND, "unknown path", head_only)
 
+    def _parse_range(self, size: int):
+        """Returns None (no usable Range header: send everything), "bad" (416) or (first, last)."""
+        header = self.headers.get("Range")
+        if not header:
+            return None
+        unit, _, spec = header.partition("=")
+        if unit.strip().lower() != "bytes" or "," in spec:
+            return None  # multi-range / other units: ignore, send the whole file
+        first_text, dash, last_text = spec.strip().partition("-")
+        if not dash:
+            return None
+        try:
+            if first_text == "":
+                # Suffix form: the last N bytes.
+                count = int(last_text)
+                if count <= 0:
+                    return "bad"
+                first, last = max(0, size - count), size - 1
+            else:
+                first = int(first_text)
+                last = int(last_text) if last_text else size - 1
+        except ValueError:
+            return None
+        if first < 0 or first >= size or last < first:
+            return "bad"
+        return first, min(last, size - 1)
+
     def _stream_file(self, file_path: str, head_only: bool) -> None:
         try:
             handle = open(file_path, "rb")
@@ -237,27 +277,49 @@ class LibraryHandler(BaseHTTPRequestHandler):
         with handle:
             size = os.fstat(handle.fileno()).st_size
             content_type = SERVED_TYPES.get(os.path.splitext(file_path)[1].lower(), "application/octet-stream")
-            self.send_response(HTTPStatus.OK)
+            byte_range = self._parse_range(size)
+            if byte_range == "bad":
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self._log(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, f"range {self.headers.get('Range')!r} of {size}")
+                return
+            if byte_range is None:
+                status, first, last = HTTPStatus.OK, 0, size - 1
+            else:
+                status = HTTPStatus.PARTIAL_CONTENT
+                first, last = byte_range
+            length = last - first + 1 if size > 0 else 0
+            self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == HTTPStatus.PARTIAL_CONTENT:
+                self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             if head_only:
-                self._log(HTTPStatus.OK, f"{size} bytes (HEAD)")
+                self._log(status, f"{length} bytes (HEAD)")
                 return
             sent = 0
             try:
-                while sent < size:
-                    chunk = handle.read(min(CHUNK, size - sent))
+                handle.seek(first)
+                while sent < length:
+                    chunk = handle.read(min(CHUNK, length - sent))
                     if not chunk:
                         break
                     self.wfile.write(chunk)
                     sent += len(chunk)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                self._log(HTTPStatus.OK, f"client went away after {sent}/{size} bytes")
+                self._log(status, f"client went away after {sent}/{length} bytes")
                 self.close_connection = True
                 return
-            self._log(HTTPStatus.OK, f"{sent} bytes")
+            note = f"{sent} bytes"
+            if status == HTTPStatus.PARTIAL_CONTENT:
+                note += f" (bytes {first}-{last}/{size})"
+            self._log(status, note)
 
 
 def lan_addresses() -> list[str]:

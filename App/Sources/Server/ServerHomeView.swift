@@ -35,6 +35,7 @@ struct ServerHomeView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
+                    ContinueCard()
                     statusArea
                     serversSection
                     settingsSection
@@ -244,16 +245,11 @@ struct ServerHomeView: View {
             SectionTitle("Servers", systemImage: "desktopcomputer")
 
             if server.servers.isEmpty {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("No servers yet. Add your PC's IP address to start streaming.")
-                        .foregroundStyle(.secondary)
-                    Button {
-                        editorTarget = ServerEditorTarget(existing: nil)
-                    } label: {
-                        Label("Add server", systemImage: "plus")
-                    }
-                }
-                .qvCard()
+                EmptyStateCard(
+                    systemImage: "desktopcomputer",
+                    title: "No servers yet",
+                    message: "Tap Add server (top right) and type your PC's IP address. The same address is used by the Rendered tab to find the QVision Library."
+                )
             } else {
                 ForEach(server.servers) { item in
                     serverRow(item)
@@ -292,6 +288,7 @@ struct ServerHomeView: View {
                 ProgressView()
             } else {
                 Button("Connect") {
+                    model.noteOpened(.server, id: item.id.uuidString, title: item.name)
                     Task {
                         await model.releaseImmersiveSpacesForStream()
                         await server.connect(to: item.id)

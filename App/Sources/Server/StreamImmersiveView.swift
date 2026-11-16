@@ -24,16 +24,34 @@ struct StreamImmersiveView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var sessionEntity = Entity()
+    /// v0.9 D1: the palm menu shared with Projects and Rendered (here: Exit only).
+    @State private var palmState = PalmMenuState()
+    @State private var updateSubscription: EventSubscription?
 
     var body: some View {
-        RealityView { content in
+        RealityView { content, attachments in
             sessionEntity.name = "CloudXRSession"
             if let session = server.streamSession {
                 sessionEntity.components[CloudXRSessionComponent.self] = .init(session: session)
             }
             content.add(sessionEntity)
             content.add(Self.makeInvisibleGestureWall())
-        } update: { _ in
+
+            if let appModel, let menu = attachments.entity(for: PalmMenuPlacement.attachmentID) {
+                PalmMenuPlacement.install(menu, in: palmState)
+                content.add(menu)
+                let hands = appModel.hands
+                let frameState = palmState
+                updateSubscription?.cancel()
+                updateSubscription = content.subscribe(to: SceneEvents.Update.self) { event in
+                    MainActor.assumeIsolated {
+                        let dt = Swift.min(Swift.max(Float(event.deltaTime), 0), 0.1)
+                        PalmMenuPlacement.update(state: frameState, hands: hands, pose: hands.devicePose(),
+                                                 deltaTime: dt, suppressed: false)
+                    }
+                }
+            }
+        } update: { _, _ in
             // Reading `phase` re-runs this on every phase change: attach the session if the
             // space opened before it existed (it normally exists already).
             _ = server.phase
@@ -41,6 +59,20 @@ struct StreamImmersiveView: View {
                let session = server.streamSession {
                 sessionEntity.components[CloudXRSessionComponent.self] = .init(session: session)
             }
+        } attachments: {
+            Attachment(id: PalmMenuPlacement.attachmentID) {
+                PalmMenuChrome {
+                    PalmMenuButton(title: "Exit", systemImage: "house", isDestructive: true) {
+                        server.disconnect()
+                    }
+                } expanded: {
+                    EmptyView()
+                }
+            }
+        }
+        .task {
+            // Our own hand tracking (palm menu) next to CloudXR's; it never blocks the stream.
+            await appModel?.hands.start(owner: "stream")
         }
         .onTapGesture(count: 3) {
             // Escape hatch (as in the sample): bring the main window back.
@@ -54,6 +86,9 @@ struct StreamImmersiveView: View {
             }
         }
         .onDisappear {
+            updateSubscription?.cancel()
+            updateSubscription = nil
+            appModel?.hands.stop(owner: "stream")
             server.isStreamSpaceOpen = false
             if server.wantsStreamSpace {
                 // The user (or the system) closed the space while streaming: end the stream and

@@ -29,8 +29,24 @@ final class AppModel {
 
     /// The tabs of Home (v0.8 R1).
     enum HomeTab: String, Hashable {
-        case projects, rendered, server
+        case projects, rendered, server, settings
     }
+
+    /// v0.9 B1: the last thing opened, for the Continue card on Home.
+    struct LastOpened: Codable, Equatable {
+        enum Kind: String, Codable {
+            case project, rendered, server
+        }
+        var kind: Kind
+        /// Project UUID string, rendered scene id (folder name) or server UUID string.
+        var id: String
+        var title: String
+        var date: Date
+    }
+
+    private static let homeTabKey = "qvision.homeTab"
+    private static let lastOpenedKey = "qvision.lastOpened"
+    private static let comfortVignetteKey = "qvision.comfortVignette"
 
     static let supportedTypes: [UTType] = {
         var types: [UTType] = [.usdz, .usd, .realityFile]
@@ -243,7 +259,21 @@ final class AppModel {
     // MARK: v0.8 state (Rendered mode)
 
     /// Selected Home tab. Leaving a rendered scene comes back to `.rendered`.
-    var homeTab: HomeTab = .projects
+    /// v0.9 B2: remembered, so Home opens on the tab used last.
+    var homeTab: HomeTab = .projects {
+        didSet {
+            guard oldValue != homeTab else { return }
+            UserDefaults.standard.set(homeTab.rawValue, forKey: Self.homeTabKey)
+        }
+    }
+
+    /// v0.9 B1: what the Continue card reopens (nil = nothing opened yet).
+    private(set) var lastOpened: LastOpened? = nil
+
+    /// v0.9 D4: soft vignette while flying fast (comfort). Default on; toggle in Settings.
+    var comfortVignette: Bool = true {
+        didSet { UserDefaults.standard.set(comfortVignette, forKey: Self.comfortVignetteKey) }
+    }
 
     /// The baked-scene viewer (observable itself: phase, speed).
     @ObservationIgnored let rendered: RenderedViewer
@@ -280,7 +310,33 @@ final class AppModel {
         let speed = Self.clampFlySpeed(Float(stored ?? 1))
         self.flySpeed = speed
         self.fly.speed = speed
+
+        let defaults = UserDefaults.standard
+        if let raw = defaults.string(forKey: Self.homeTabKey), let tab = HomeTab(rawValue: raw), tab != .settings {
+            self.homeTab = tab
+        }
+        if let data = defaults.data(forKey: Self.lastOpenedKey),
+           let record = try? JSONDecoder().decode(LastOpened.self, from: data) {
+            self.lastOpened = record
+        }
+        self.comfortVignette = (defaults.object(forKey: Self.comfortVignetteKey) as? Bool) ?? true
         applyInteractionToStage()
+    }
+
+    // MARK: - Continue (v0.9 B1)
+
+    /// Records what was opened last (persisted) for the Continue card.
+    func noteOpened(_ kind: LastOpened.Kind, id: String, title: String) {
+        let record = LastOpened(kind: kind, id: id, title: title, date: Date())
+        lastOpened = record
+        if let data = try? JSONEncoder().encode(record) {
+            UserDefaults.standard.set(data, forKey: Self.lastOpenedKey)
+        }
+    }
+
+    func clearLastOpened() {
+        lastOpened = nil
+        UserDefaults.standard.removeObject(forKey: Self.lastOpenedKey)
     }
 
     // MARK: - Projects
@@ -323,6 +379,9 @@ final class AppModel {
             lastError = "Couldn't delete the project: \(error.localizedDescription)"
         }
         projects.removeAll { $0.id == id }
+        if lastOpened?.kind == .project, lastOpened?.id == id.uuidString {
+            clearLastOpened()
+        }
     }
 
     /// Opens a project (serialized with every other open / leave) and the stage with it.
@@ -360,6 +419,8 @@ final class AppModel {
         isImportPickerRequested = false
         mainWindowHandedOffProjectID = nil
         stage.clear()
+        // v0.9 audit M1: environments (sky, floor, IBL textures) don't outlive the project.
+        stage.releaseEnvironments()
         fly.resetOffset(worldRoot: stage.worldRoot)
         resetHistories()
         // Cancels a running project load (its completion is ignored).
@@ -1204,6 +1265,8 @@ final class AppModel {
         openingProjectID = id
         mainWindowHandedOffProjectID = nil
         currentProject = project
+        homeTab = .projects
+        noteOpened(.project, id: id.uuidString, title: project.name)
         interactionMode = .view
         selectedItemID = nil
         selectedPartID = nil
@@ -1379,6 +1442,7 @@ final class AppModel {
         homeTab = .rendered
         renderedHandedOffSceneID = nil
         currentRenderedScene = scene
+        noteOpened(.rendered, id: scene.id, title: scene.title)
         rendered.begin(scene)
         await syncRendered()
         if currentRenderedScene == nil {

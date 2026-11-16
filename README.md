@@ -35,6 +35,15 @@ A *Rendered package* is `<Name>.usdz` (Y-up, metres, final lit colour baked into
 
 Budget per scene: about 1.5 M triangles, at most eight 4096² atlases, USDZ up to about 500 MB.
 
+### New in v0.9
+- **Continue** card at the top of Home reopens the last project, rendered scene or server in one tap. Home opens on the tab you used last.
+- **Rendered tab** connects to the PC by itself and keeps trying while it is visible. Downloads resume after an interruption. A scene whose PC copy changed shows an **Update** badge. HD packages show an **HD** badge.
+- **One palm menu** in all three modes (left palm toward you): Home/Exit, then Viewpoints (Rendered) or Panel (Projects), then Speed (Walk 1×, Fast 3×, Fly 10×).
+- **Viewpoints**: named places from the sidecar's `viewpoints` list; choosing one moves you there with a short fade. A rendered scene reopens where you left it.
+- **Settings** tab: version, days left on the 7-day signing, storage with Free up space, the comfort vignette toggle and fly speeds.
+- The library server answers `GET /health` and `Range` requests (`tools/library-server/qvision_library.py`).
+- Audit: `docs/v0.9-AUDIT.md`.
+
 ## Supported 3D formats
 
 | Format | Status | Notes |

@@ -44,6 +44,10 @@ struct ProjectsHomeView: View {
             .padding(.top, 22)
             .padding(.bottom, 16)
 
+            ContinueCard()
+                .padding(.horizontal, 36)
+                .padding(.bottom, 20)
+
             if model.projects.isEmpty {
                 emptyState
             } else {
@@ -119,11 +123,9 @@ struct ProjectsHomeView: View {
                 startCreating()
             } label: {
                 Label("New Project", systemImage: "plus")
-                    .font(.headline)
-                    .padding(.horizontal, 12)
+                    .primaryActionLabel(expands: false)
             }
             .buttonStyle(.borderedProminent)
-            .controlSize(.large)
 
             HStack(spacing: 8) {
                 ForEach(["USDZ", "USD", "Reality", "OBJ"], id: \.self) { format in
@@ -231,7 +233,7 @@ private struct ProjectCardContent: View {
             ProjectMonogram(project: project, height: 118)
                 .overlay(alignment: .bottomLeading) {
                     Label(project.viewMode.title, systemImage: project.viewMode.systemImage)
-                        .font(.caption.weight(.semibold))
+                        .font(.footnote.weight(.semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
@@ -264,7 +266,7 @@ private struct ProjectCardContent: View {
                 Label(objectCountText, systemImage: "cube")
                 Label(layerCountText, systemImage: "square.3.layers.3d")
             }
-            .font(.caption)
+            .font(.footnote)
             .foregroundStyle(.secondary)
             .lineLimit(1)
         }

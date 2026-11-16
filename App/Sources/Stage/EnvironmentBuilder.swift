@@ -177,6 +177,15 @@ enum EnvironmentBuilder {
     @MainActor private static var environmentCache: [EnvironmentPreset: EnvironmentResource] = [:]
     @MainActor private static var skyMeshCache: MeshResource?
 
+    /// v0.9 (audit M1): drops the cached sky / floor textures, IBL resources and the dome mesh.
+    /// Called when a project or a rendered scene is left, so several hundred MB of textures
+    /// don't stay allocated while another mode needs the memory. They are rebuilt on demand.
+    @MainActor static func purgeCaches() {
+        textureCache.removeAll()
+        environmentCache.removeAll()
+        skyMeshCache = nil
+    }
+
     // MARK: - Baked build
 
     @MainActor private static func makeBaked(_ preset: EnvironmentPreset, look: Look) async -> Entity? {

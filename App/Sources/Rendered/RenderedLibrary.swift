@@ -4,8 +4,14 @@ import Observation
 /// Rendered scenes on this Vision Pro (Documents/Rendered) and the QVision Library on the PC
 /// (`tools/library-server/qvision_library.py`, HTTP on port 8770, LAN only).
 ///
-/// Downloads go into a staging folder and are renamed into place only when every file arrived
-/// complete; cancel or failure deletes the staging folder (no partial scene is ever listed).
+/// v0.9:
+/// - the Rendered tab connects by itself (`poll`), quietly, every few seconds while visible;
+/// - `GET /health` tells "library up" from "nothing there" from "something else answers";
+/// - downloads resume: the USDZ is written to `Documents/Rendered/.resume-<id>/` and an
+///   interrupted transfer continues with an HTTP Range request. The folder becomes a scene only
+///   when the file is complete and its size verified (rename into place);
+/// - sidecars of downloaded scenes are refreshed from the PC whenever the library is reachable
+///   (they are tiny), so new viewpoints arrive without downloading the scene again.
 @MainActor
 @Observable
 final class RenderedLibrary {
@@ -39,9 +45,15 @@ final class RenderedLibrary {
     private(set) var entries: [LibraryEntry] = []
     private(set) var indexState: IndexState = .idle
     private(set) var indexHost: String? = nil
+    /// The address of the last attempt (shown in the "can't reach" help).
+    private(set) var triedAddress: String? = nil
+    /// `version` from /health (nil = unknown / library version 1).
+    private(set) var libraryVersion: Int? = nil
 
     /// Running downloads by library entry id.
     private(set) var downloads: [String: Download] = [:]
+    /// Bytes already on this Vision Pro of interrupted downloads, by library entry id.
+    private(set) var partials: [String: Int64] = [:]
 
     /// "Copying Casa.usdz…" while an import from Files runs.
     private(set) var importStatus: String? = nil
@@ -56,7 +68,10 @@ final class RenderedLibrary {
     @ObservationIgnored let rootFolder: URL
     @ObservationIgnored private let session: URLSession
     @ObservationIgnored private var downloadTasks: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var userCancelled: Set<String> = []
     @ObservationIgnored private var indexTask: Task<Void, Never>? = nil
+    @ObservationIgnored private var isFetchingIndex = false
+    @ObservationIgnored private var lastSidecarSync: TimeInterval = 0
 
     init() {
         let configuration = URLSessionConfiguration.default
@@ -78,6 +93,15 @@ final class RenderedLibrary {
 
     func refresh() {
         scenes = RenderedFiles.scan(root: rootFolder)
+        var found: [String: Int64] = [:]
+        for folder in RenderedFiles.resumeFolders(in: rootFolder) {
+            guard let meta = Self.loadResumeMeta(folder) else { continue }
+            let file = folder.appendingPathComponent(meta.file, isDirectory: false)
+            if let size = RenderedFiles.fileSize(file), size > 0 {
+                found[meta.id] = size
+            }
+        }
+        partials = found
     }
 
     func scene(id: String) -> RenderedScene? {
@@ -88,14 +112,37 @@ final class RenderedLibrary {
     func delete(_ scene: RenderedScene) {
         do {
             try FileManager.default.removeItem(at: scene.folder)
+            RenderedViewer.forgetLastPose(sceneID: scene.id)
         } catch {
             lastError = "“\(scene.title)” couldn't be deleted: \(error.localizedDescription)"
         }
         refresh()
     }
 
+    /// Settings › Free up space: every downloaded scene (they can be downloaded again).
+    func deleteAllScenes(except keepID: String?) {
+        for scene in scenes where scene.id != keepID {
+            try? FileManager.default.removeItem(at: scene.folder)
+            RenderedViewer.forgetLastPose(sceneID: scene.id)
+        }
+        refresh()
+    }
+
+    /// Settings › Free up space: interrupted downloads that aren't running now.
+    func clearPartialDownloads() {
+        let active = Set(downloads.keys.map(Self.resumeFolderName))
+        for folder in RenderedFiles.resumeFolders(in: rootFolder) where !active.contains(folder.lastPathComponent) {
+            try? FileManager.default.removeItem(at: folder)
+        }
+        refresh()
+    }
+
     var totalBytes: Int64 {
         scenes.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    var partialBytes: Int64 {
+        partials.values.reduce(0, +)
     }
 
     // MARK: - On my PC
@@ -135,49 +182,78 @@ final class RenderedLibrary {
         return URL(string: base.absoluteString + "/files/" + encoded)
     }
 
-    /// Fetches `GET /index.json` from the library at `address`.
-    func fetchIndex(address: String) {
+    /// Called by the Rendered tab every few seconds while it is visible: connects, reconnects
+    /// and refreshes without any spinner flicker.
+    func poll(address: String) {
+        guard !isFetchingIndex else { return }
+        fetchIndex(address: address, quiet: indexState != .idle)
+    }
+
+    /// Fetches `GET /health` then `GET /index.json` from the library at `address`.
+    /// `quiet`: keep showing what is shown now until the answer arrives.
+    func fetchIndex(address: String, quiet: Bool = false) {
         indexTask?.cancel()
+        triedAddress = address
         guard let base = Self.baseURL(for: address),
-              let url = URL(string: base.absoluteString + "/index.json") else {
+              let healthURL = URL(string: base.absoluteString + "/health"),
+              let indexURL = URL(string: base.absoluteString + "/index.json") else {
             indexState = .failed("Enter the PC's IP address (for example 192.168.0.87).")
             return
         }
-        indexState = .loading
-        let host = address
+        if !quiet { indexState = .loading }
+        isFetchingIndex = true
         indexTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.isFetchingIndex = false }
             do {
-                var request = URLRequest(url: url)
+                // 1. Is anything there, and is it the library?
+                var health = URLRequest(url: healthURL)
+                health.timeoutInterval = 4
+                let (healthData, healthResponse) = try await self.session.data(for: health)
+                try Task.checkCancellation()
+                let healthStatus = (healthResponse as? HTTPURLResponse)?.statusCode ?? 0
+                if healthStatus == 403 {
+                    throw RenderedError.message("The QVision Library refused this headset (LAN clients only). Check that the headset and the PC are on the same network.")
+                }
+                var version: Int? = nil
+                if healthStatus == 200,
+                   let object = try? JSONSerialization.jsonObject(with: healthData) as? [String: Any],
+                   (object["name"] as? String) == "QVision Library" {
+                    version = object["version"] as? Int
+                } else if healthStatus != 404 {
+                    // 404 = the first library version (no /health): the index decides.
+                    throw RenderedError.message(Self.wrongProgramText(address))
+                }
+
+                // 2. The index.
+                var request = URLRequest(url: indexURL)
                 request.timeoutInterval = 8
                 let (data, response) = try await self.session.data(for: request)
                 try Task.checkCancellation()
-                guard let http = response as? HTTPURLResponse else {
-                    throw RenderedError.message("The PC didn't answer with HTTP.")
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let decoded = try? JSONDecoder().decode([LibraryEntry].self, from: data) else {
+                    throw RenderedError.message(Self.wrongProgramText(address))
                 }
-                guard http.statusCode == 200 else {
-                    if http.statusCode == 403 {
-                        throw RenderedError.message("The QVision Library refused this headset (LAN clients only). Check that the headset and the PC are on the same network.")
-                    }
-                    throw RenderedError.message("The QVision Library answered HTTP \(http.statusCode).")
-                }
-                let decoded: [LibraryEntry]
-                do {
-                    decoded = try JSONDecoder().decode([LibraryEntry].self, from: data)
-                } catch {
-                    throw RenderedError.message("The PC answered, but not with a QVision Library index. Is another program using port \(Self.port)?")
-                }
-                self.entries = decoded.filter { $0.file.lowercased().hasSuffix(".usdz") }
-                self.indexHost = host
-                self.indexState = .loaded
+                let listed = decoded.filter { $0.file.lowercased().hasSuffix(".usdz") }
+                if self.entries != listed { self.entries = listed }
+                self.libraryVersion = version
+                self.indexHost = address
+                if self.indexState != .loaded { self.indexState = .loaded }
+                await self.syncSidecars(address: address)
             } catch is CancellationError {
                 // A newer fetch replaced this one.
             } catch let error as URLError where error.code == .cancelled {
                 // Replaced.
             } catch {
-                self.indexState = .failed(Self.describeNetworkError(error, address: address))
+                let message = Self.describeNetworkError(error, address: address)
+                if self.indexState != .failed(message) { self.indexState = .failed(message) }
             }
         }
+    }
+
+    private static func wrongProgramText(_ address: String) -> String {
+        let place = parseAddress(address).map { "\($0.host):\($0.port)" } ?? address
+        return "Something answers at \(place), but it isn't the QVision Library. Check the address: it is the one shown in the QVision Library (PC) window."
     }
 
     /// The stored copy of a library entry, if any.
@@ -188,6 +264,12 @@ final class RenderedLibrary {
         return scenes.first { $0.id == RenderedFiles.sanitizedName(entry.id) }
     }
 
+    /// The library entry a stored scene came from (if the PC lists it now).
+    func entry(for scene: RenderedScene) -> LibraryEntry? {
+        guard indexState == .loaded else { return nil }
+        return entries.first { localScene(for: $0)?.id == scene.id }
+    }
+
     /// true if the stored copy matches the PC's file (same size and date).
     func isUpToDate(_ entry: LibraryEntry) -> Bool {
         guard let local = localScene(for: entry) else { return false }
@@ -195,23 +277,81 @@ final class RenderedLibrary {
         return origin.sizeBytes == entry.sizeBytes && origin.modified == entry.modified
     }
 
-    // MARK: - Downloads
+    /// A stored scene whose PC copy changed since it was downloaded.
+    func hasUpdate(_ scene: RenderedScene) -> Bool {
+        guard let entry = entry(for: scene) else { return false }
+        return !isUpToDate(entry)
+    }
+
+    /// Copies newer sidecars from the PC next to the scenes already downloaded (at most once a
+    /// minute). A scene baked before viewpoints existed gets them this way.
+    private func syncSidecars(address: String) async {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastSidecarSync > 60 else { return }
+        lastSidecarSync = now
+        var changed = false
+        for entry in entries {
+            guard let listed = entry.sidecar, let name = RenderedFiles.safeFileName(listed),
+                  let local = localScene(for: entry),
+                  local.origin?.source == "library",
+                  downloads[entry.id] == nil,
+                  let url = Self.fileURL(address: address, name: name),
+                  let data = try? await fetchData(url),
+                  (try? JSONDecoder().decode(RenderedSidecar.self, from: data)) != nil else { continue }
+            let stem = local.usdzURL.deletingPathExtension().lastPathComponent
+            let target = local.sidecarURL ?? local.folder.appendingPathComponent(stem + ".json", isDirectory: false)
+            if (try? Data(contentsOf: target)) != data {
+                if (try? data.write(to: target, options: .atomic)) != nil {
+                    changed = true
+                }
+            }
+        }
+        if changed { refresh() }
+    }
+
+    // MARK: - Downloads (resumable)
+
+    private struct ResumeMeta: Codable {
+        var id: String
+        var file: String
+        var modified: String?
+        var sizeBytes: Int64
+    }
+
+    private static func resumeFolderName(_ entryID: String) -> String {
+        RenderedFiles.resumePrefix + RenderedFiles.sanitizedName(entryID)
+    }
+
+    private static func loadResumeMeta(_ folder: URL) -> ResumeMeta? {
+        let url = folder.appendingPathComponent(RenderedFiles.resumeMetaName, isDirectory: false)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(ResumeMeta.self, from: data)
+    }
 
     func download(_ entry: LibraryEntry) {
         guard downloads[entry.id] == nil, let address = indexHost else { return }
-        downloads[entry.id] = Download(title: entry.title, stage: .preparing, received: 0, expected: entry.sizeBytes)
+        let already = partials[entry.id] ?? 0
+        downloads[entry.id] = Download(title: entry.title, stage: .preparing, received: already, expected: entry.sizeBytes)
         let id = entry.id
+        userCancelled.remove(id)
         downloadTasks[id] = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.performDownload(entry, address: address)
-            } catch is CancellationError {
-                // Cancelled by the user: the staging folder is already gone.
-            } catch let error as URLError where error.code == .cancelled {
-                // Cancelled.
             } catch {
-                self.lastError = "“\(entry.title)” couldn't be downloaded. " + Self.describeNetworkError(error, address: address)
+                let cancelled = (error is CancellationError) || ((error as? URLError)?.code == .cancelled)
+                if cancelled || self.userCancelled.contains(id) {
+                    if self.userCancelled.contains(id) {
+                        // Cancel = discard what arrived. (An interruption keeps it for Resume.)
+                        let folder = self.rootFolder.appendingPathComponent(Self.resumeFolderName(id), isDirectory: true)
+                        try? FileManager.default.removeItem(at: folder)
+                    }
+                } else {
+                    self.lastError = "“\(entry.title)” stopped downloading. " + Self.describeNetworkError(error, address: address)
+                        + " What arrived is kept: tap Resume to continue."
+                }
             }
+            self.userCancelled.remove(id)
             self.downloads[id] = nil
             self.downloadTasks[id] = nil
             self.refresh()
@@ -219,6 +359,7 @@ final class RenderedLibrary {
     }
 
     func cancelDownload(_ id: String) {
+        userCancelled.insert(id)
         downloadTasks[id]?.cancel()
     }
 
@@ -232,16 +373,30 @@ final class RenderedLibrary {
             throw RenderedError.message("The library listed an invalid file name.")
         }
 
-        if let free = RenderedFiles.availableCapacity(at: rootFolder),
-           entry.sizeBytes > 0, free < entry.sizeBytes + 200_000_000 {
-            throw RenderedError.message("Not enough free space on this Vision Pro: it needs \(RenderedFiles.byteText(entry.sizeBytes)), \(RenderedFiles.byteText(max(free, 0))) is free. Delete a scene first.")
+        // Staging folder: reused if it holds the same file (same name, size and date).
+        let staging = rootFolder.appendingPathComponent(Self.resumeFolderName(entry.id), isDirectory: true)
+        if let meta = Self.loadResumeMeta(staging),
+           meta.file != usdzName || meta.sizeBytes != entry.sizeBytes || meta.modified != entry.modified {
+            try? fm.removeItem(at: staging)
+        } else if fm.fileExists(atPath: staging.path), Self.loadResumeMeta(staging) == nil {
+            try? fm.removeItem(at: staging)
+        }
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        let meta = ResumeMeta(id: entry.id, file: usdzName, modified: entry.modified, sizeBytes: entry.sizeBytes)
+        try JSONEncoder().encode(meta).write(to: staging.appendingPathComponent(RenderedFiles.resumeMetaName, isDirectory: false), options: .atomic)
+
+        let destination = staging.appendingPathComponent(usdzName, isDirectory: false)
+        var offset = RenderedFiles.fileSize(destination) ?? 0
+        if entry.sizeBytes > 0, offset > entry.sizeBytes {
+            try? fm.removeItem(at: destination)
+            offset = 0
         }
 
-        let staging = rootFolder.appendingPathComponent(RenderedFiles.partialPrefix + UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
-        var completed = false
-        defer {
-            if !completed { try? fm.removeItem(at: staging) }
+        if let free = RenderedFiles.availableCapacity(at: rootFolder), entry.sizeBytes > 0 {
+            let needed = entry.sizeBytes - offset
+            if free < needed + 200_000_000 {
+                throw RenderedError.message("Not enough free space on this Vision Pro: it needs \(RenderedFiles.byteText(needed)), \(RenderedFiles.byteText(max(free, 0))) is free. Delete a scene first (Settings › Storage).")
+            }
         }
 
         // 1. Sidecar (required if listed: without it the start position would be wrong).
@@ -258,34 +413,48 @@ final class RenderedLibrary {
         }
         try Task.checkCancellation()
 
-        // 3. The scene itself, with progress.
-        downloads[entry.id]?.stage = .downloading
-        let destination = staging.appendingPathComponent(usdzName, isDirectory: false)
+        // 3. The scene itself, continuing where a previous attempt stopped.
         let id = entry.id
-        try await downloadFile(from: usdzURL, to: destination) { [weak self] received, expected in
-            guard let self, var state = self.downloads[id] else { return }
-            state.received = received
-            if expected > 0 { state.expected = expected }
-            self.downloads[id] = state
+        downloads[id]?.stage = .downloading
+        downloads[id]?.received = offset
+        if !(entry.sizeBytes > 0 && offset == entry.sizeBytes) {
+            let transfer = ResumableTransfer(url: usdzURL, destination: destination, offset: offset)
+            let poll = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    if let self, var state = self.downloads[id] {
+                        let received = transfer.received
+                        let total = transfer.total
+                        if state.received != received || (total > 0 && state.expected != total) {
+                            state.received = received
+                            if total > 0 { state.expected = total }
+                            self.downloads[id] = state
+                        }
+                    }
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+            }
+            defer { poll.cancel() }
+            try await transfer.run()
         }
         try Task.checkCancellation()
 
-        downloads[entry.id]?.stage = .finishing
+        downloads[id]?.stage = .finishing
         let size = RenderedFiles.fileSize(destination) ?? 0
         if entry.sizeBytes > 0, size != entry.sizeBytes {
-            throw RenderedError.message("The file arrived incomplete (\(RenderedFiles.byteText(size)) of \(RenderedFiles.byteText(entry.sizeBytes))). Try again.")
+            // The file on the PC changed mid-download, or the data is wrong: start clean next time.
+            try? fm.removeItem(at: staging)
+            throw RenderedError.message("The file didn't arrive complete (\(RenderedFiles.byteText(size)) of \(RenderedFiles.byteText(entry.sizeBytes))). Tap Download to start again.")
         }
 
+        try? fm.removeItem(at: staging.appendingPathComponent(RenderedFiles.resumeMetaName, isDirectory: false))
         try RenderedFiles.writeOrigin(RenderedOrigin(source: "library", libraryID: entry.id, host: address,
                                                      modified: entry.modified, sizeBytes: entry.sizeBytes,
                                                      title: entry.title, addedAt: Date()),
                                       into: staging)
-        try Task.checkCancellation()
 
         let existing = localScene(for: entry)?.id
         let folderName = existing ?? RenderedFiles.uniqueFolderName(RenderedFiles.sanitizedName(entry.id), in: rootFolder)
         try RenderedFiles.moveIntoPlace(staging: staging, final: rootFolder.appendingPathComponent(folderName, isDirectory: true))
-        completed = true
     }
 
     private func fetchData(_ url: URL) async throws -> Data {
@@ -295,61 +464,6 @@ final class RenderedLibrary {
             throw RenderedError.message("The library answered HTTP \(code) for \(url.lastPathComponent).")
         }
         return data
-    }
-
-    /// Downloads `url` into `destination` with a download task (the system writes it to a
-    /// temporary file, which is moved to `destination` before the handler returns).
-    /// `progress` is called on the main actor about four times a second.
-    private func downloadFile(from url: URL, to destination: URL,
-                              progress: @escaping @MainActor (Int64, Int64) -> Void) async throws {
-        let box = DownloadTaskBox()
-        let session = self.session
-
-        let poll = Task { @MainActor in
-            while !Task.isCancelled {
-                if let task = box.current {
-                    progress(task.countOfBytesReceived, task.countOfBytesExpectedToReceive)
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
-        }
-        defer { poll.cancel() }
-
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let task = session.downloadTask(with: url) { temporaryURL, response, error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    guard let http = response as? HTTPURLResponse else {
-                        continuation.resume(throwing: RenderedError.message("The PC didn't answer with HTTP."))
-                        return
-                    }
-                    guard http.statusCode == 200 else {
-                        continuation.resume(throwing: RenderedError.message("The library answered HTTP \(http.statusCode)."))
-                        return
-                    }
-                    guard let temporaryURL else {
-                        continuation.resume(throwing: RenderedError.message("The download produced no file."))
-                        return
-                    }
-                    do {
-                        let fm = FileManager.default
-                        if fm.fileExists(atPath: destination.path) {
-                            try fm.removeItem(at: destination)
-                        }
-                        try fm.moveItem(at: temporaryURL, to: destination)
-                        continuation.resume()
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
-                }
-                box.start(task)
-            }
-        } onCancel: {
-            box.cancel()
-        }
     }
 
     // MARK: - Import from Files
@@ -406,53 +520,181 @@ final class RenderedLibrary {
         if let rendered = error as? RenderedError {
             return rendered.localizedDescription
         }
-        let where_ = parseAddress(address).map { "\($0.host):\($0.port)" } ?? address
+        let place = parseAddress(address).map { "\($0.host):\($0.port)" } ?? address
         if let urlError = error as? URLError {
             switch urlError.code {
             case .cannotConnectToHost, .cannotFindHost, .timedOut, .networkConnectionLost, .dnsLookupFailed:
-                return "Can't reach the QVision Library at \(where_). On the PC, open “QVision Library (PC)” (Desktop › Vision Pro), check the address, and run add-library-firewall.ps1 once as administrator."
+                return "No answer from \(place). Start “QVision Library (PC)” on your PC (Desktop › Vision Pro). It now also starts with Windows."
             case .notConnectedToInternet:
-                return "No network connection. Check Wi-Fi, and allow QVision on the local network (Settings › Privacy & Security › Local Network)."
+                return "No network. Check Wi-Fi, and allow QVision on the local network (Settings › Privacy & Security › Local Network)."
             case .appTransportSecurityRequiresSecureConnection:
-                return "This address isn't a local network address. Use the PC's LAN IP address."
+                return "\(place) isn't a local network address. Use the PC's LAN IP address."
             default:
-                return "Network error at \(where_): \(urlError.localizedDescription)"
+                return "Network error at \(place): \(urlError.localizedDescription)"
             }
         }
         return error.localizedDescription
     }
 }
 
-/// Holds the running URLSessionDownloadTask so it can be cancelled from any thread and polled
-/// for progress from the main actor.
-private final class DownloadTaskBox: @unchecked Sendable {
+/// One HTTP GET written straight to a file, continuing at `offset` with a Range request.
+/// 206 = the server continues: append. 200 = it sends everything: start the file again.
+/// Thread-safe counters are polled from the main actor for the progress bar.
+private final class ResumableTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let url: URL
+    private let destination: URL
+    private let offset: Int64
+
     private let lock = NSLock()
-    private var task: URLSessionDownloadTask?
+    private var receivedBytes: Int64
+    private var totalBytes: Int64 = 0
+    private var handle: FileHandle?
+    private var failure: Error?
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var task: URLSessionDataTask?
+    private var session: URLSession?
     private var isCancelled = false
 
-    var current: URLSessionDownloadTask? {
-        lock.lock()
-        defer { lock.unlock() }
-        return task
+    init(url: URL, destination: URL, offset: Int64) {
+        self.url = url
+        self.destination = destination
+        self.offset = offset
+        self.receivedBytes = offset
     }
 
-    func start(_ newTask: URLSessionDownloadTask) {
+    var received: Int64 {
         lock.lock()
-        task = newTask
-        let cancelled = isCancelled
-        lock.unlock()
-        if cancelled {
-            newTask.cancel()
-        } else {
-            newTask.resume()
+        defer { lock.unlock() }
+        return receivedBytes
+    }
+
+    var total: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalBytes
+    }
+
+    func run() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let configuration = URLSessionConfiguration.default
+                configuration.timeoutIntervalForRequest = 30
+                configuration.timeoutIntervalForResource = 6 * 60 * 60
+                configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+                configuration.urlCache = nil
+                let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+                var request = URLRequest(url: url)
+                if offset > 0 {
+                    request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+                }
+                let task = session.dataTask(with: request)
+                lock.lock()
+                self.continuation = continuation
+                self.session = session
+                self.task = task
+                let cancelled = isCancelled
+                lock.unlock()
+                if cancelled {
+                    task.cancel()
+                }
+                task.resume()
+            }
+        } onCancel: {
+            self.cancel()
         }
     }
 
-    func cancel() {
+    private func cancel() {
         lock.lock()
         isCancelled = true
         let running = task
         lock.unlock()
         running?.cancel()
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let fm = FileManager.default
+        do {
+            switch status {
+            case 206:
+                if !fm.fileExists(atPath: destination.path) {
+                    fm.createFile(atPath: destination.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: destination)
+                try handle.truncate(atOffset: UInt64(offset))
+                try handle.seek(toOffset: UInt64(offset))
+                lock.lock()
+                self.handle = handle
+                receivedBytes = offset
+                totalBytes = offset + max(response.expectedContentLength, 0)
+                lock.unlock()
+            case 200:
+                fm.createFile(atPath: destination.path, contents: nil)
+                let handle = try FileHandle(forWritingTo: destination)
+                lock.lock()
+                self.handle = handle
+                receivedBytes = 0
+                totalBytes = max(response.expectedContentLength, 0)
+                lock.unlock()
+            case 416:
+                // Our partial file doesn't match the server's any more: start over next time.
+                try? fm.removeItem(at: destination)
+                throw RenderedError.message("The file on the PC changed. Tap Download to start again.")
+            default:
+                throw RenderedError.message("The library answered HTTP \(status).")
+            }
+            completionHandler(.allow)
+        } catch {
+            lock.lock()
+            failure = error
+            lock.unlock()
+            completionHandler(.cancel)
+        }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        let handle = self.handle
+        lock.unlock()
+        guard let handle else { return }
+        do {
+            try handle.write(contentsOf: data)
+            lock.lock()
+            receivedBytes += Int64(data.count)
+            lock.unlock()
+        } catch {
+            lock.lock()
+            if failure == nil { failure = error }
+            lock.unlock()
+            dataTask.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        let handle = self.handle
+        self.handle = nil
+        let continuation = self.continuation
+        self.continuation = nil
+        let stored = failure
+        let cancelled = isCancelled
+        self.task = nil
+        self.session = nil
+        lock.unlock()
+
+        try? handle?.close()
+        session.finishTasksAndInvalidate()
+
+        if cancelled {
+            continuation?.resume(throwing: CancellationError())
+        } else if let stored {
+            continuation?.resume(throwing: stored)
+        } else if let error {
+            continuation?.resume(throwing: error)
+        } else {
+            continuation?.resume()
+        }
     }
 }

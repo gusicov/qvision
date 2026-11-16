@@ -37,21 +37,64 @@ struct RenderedSidecar: Codable, Equatable {
         }
     }
 
+    /// v0.9: a named place to jump to (same conventions as `start`).
+    struct Viewpoint: Codable, Equatable {
+        var name: String?
+        var position: [Float]?
+        var yawDegrees: Float?
+
+        init(name: String? = nil, position: [Float]? = nil, yawDegrees: Float? = nil) {
+            self.name = name
+            self.position = position
+            self.yawDegrees = yawDegrees
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            name = try? c.decodeIfPresent(String.self, forKey: .name)
+            position = try? c.decodeIfPresent([Float].self, forKey: .position)
+            yawDegrees = try? c.decodeIfPresent(Float.self, forKey: .yawDegrees)
+        }
+    }
+
     var title: String?
     var version: Int?
     var start: Start?
     var eyeHeightIncluded: Bool?
     var notes: String?
     var hasSky: Bool?
+    /// "hd-lightmap" for HD packages (albedo x lightmap shader graph).
+    var shading: String?
+    var viewpoints: [Viewpoint]?
 
     init(title: String? = nil, version: Int? = nil, start: Start? = nil,
-         eyeHeightIncluded: Bool? = nil, notes: String? = nil, hasSky: Bool? = nil) {
+         eyeHeightIncluded: Bool? = nil, notes: String? = nil, hasSky: Bool? = nil,
+         shading: String? = nil, viewpoints: [Viewpoint]? = nil) {
         self.title = title
         self.version = version
         self.start = start
         self.eyeHeightIncluded = eyeHeightIncluded
         self.notes = notes
         self.hasSky = hasSky
+        self.shading = shading
+        self.viewpoints = viewpoints
+    }
+
+    var isHD: Bool { shading == "hd-lightmap" }
+
+    /// Viewpoints with a usable position: (name, position, yaw in degrees).
+    var usableViewpoints: [(name: String, position: SIMD3<Float>, yawDegrees: Float)] {
+        var result: [(name: String, position: SIMD3<Float>, yawDegrees: Float)] = []
+        for (index, viewpoint) in (viewpoints ?? []).enumerated() {
+            guard let p = viewpoint.position, p.count >= 3,
+                  p[0].isFinite, p[1].isFinite, p[2].isFinite else { continue }
+            let trimmed = viewpoint.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let yaw = viewpoint.yawDegrees ?? 0
+            result.append((name: trimmed.isEmpty ? "Viewpoint \(index + 1)" : trimmed,
+                           position: SIMD3<Float>(p[0], p[1], p[2]),
+                           yawDegrees: yaw.isFinite ? yaw : 0))
+        }
+        return result
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +105,8 @@ struct RenderedSidecar: Codable, Equatable {
         eyeHeightIncluded = try? c.decodeIfPresent(Bool.self, forKey: .eyeHeightIncluded)
         notes = try? c.decodeIfPresent(String.self, forKey: .notes)
         hasSky = try? c.decodeIfPresent(Bool.self, forKey: .hasSky)
+        shading = try? c.decodeIfPresent(String.self, forKey: .shading)
+        viewpoints = try? c.decodeIfPresent([Viewpoint].self, forKey: .viewpoints)
     }
 
     /// `start.position` if it is three finite numbers.
@@ -92,6 +137,12 @@ struct LibraryEntry: Codable, Identifiable, Hashable {
     var modified: String?
     var thumbnail: String?
     var sidecar: String?
+    /// "hd-lightmap" for HD packages (library version 2+).
+    var shading: String?
+
+    var isHD: Bool { shading == "hd-lightmap" }
+
+    private static let isoFormatter = ISO8601DateFormatter()
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -104,12 +155,13 @@ struct LibraryEntry: Codable, Identifiable, Hashable {
         modified = (try? c.decodeIfPresent(String.self, forKey: .modified)) ?? nil
         thumbnail = (try? c.decodeIfPresent(String.self, forKey: .thumbnail)) ?? nil
         sidecar = (try? c.decodeIfPresent(String.self, forKey: .sidecar)) ?? nil
+        shading = (try? c.decodeIfPresent(String.self, forKey: .shading)) ?? nil
     }
 
     /// `modified` (ISO 8601) as a date.
     var modifiedDate: Date? {
         guard let modified else { return nil }
-        return ISO8601DateFormatter().date(from: modified)
+        return Self.isoFormatter.date(from: modified)
     }
 }
 
@@ -138,9 +190,13 @@ struct RenderedScene: Identifiable, Hashable {
     let sizeBytes: Int64
     let addedAt: Date
     let origin: RenderedOrigin?
+    /// From the sidecar: HD package (albedo x lightmap), number of named viewpoints.
+    let isHD: Bool
+    let viewpointCount: Int
 
     static func == (lhs: RenderedScene, rhs: RenderedScene) -> Bool {
         lhs.id == rhs.id && lhs.usdzURL == rhs.usdzURL && lhs.sizeBytes == rhs.sizeBytes && lhs.title == rhs.title
+            && lhs.isHD == rhs.isHD && lhs.viewpointCount == rhs.viewpointCount && lhs.origin == rhs.origin
     }
 
     func hash(into hasher: inout Hasher) {
@@ -163,6 +219,9 @@ enum RenderedFiles {
     static let folderName = "Rendered"
     static let originFileName = ".qvision-origin.json"
     static let partialPrefix = ".partial-"
+    /// v0.9: staging folder of a resumable download, kept after an interruption.
+    static let resumePrefix = ".resume-"
+    static let resumeMetaName = "resume.json"
     static let thumbnailExtensions = ["jpg", "jpeg", "png"]
 
     /// Documents/Rendered (created if missing).
@@ -241,7 +300,9 @@ enum RenderedFiles {
             thumbnailURL: thumbnailURL,
             sizeBytes: total,
             addedAt: added,
-            origin: origin
+            origin: origin,
+            isHD: sidecar?.isHD ?? false,
+            viewpointCount: sidecar?.usableViewpoints.count ?? 0
         )
     }
 
@@ -391,6 +452,27 @@ enum RenderedFiles {
         guard let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
               let capacity = values.volumeAvailableCapacityForImportantUsage else { return nil }
         return capacity
+    }
+
+    /// Total bytes of every file under `folder` (recursive). Off the main actor for big trees.
+    static func directorySize(_ folder: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: folder, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
+    }
+
+    /// Interrupted downloads kept for resuming: their folders and total size.
+    static func resumeFolders(in root: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: root.path) else { return [] }
+        return names.filter { $0.hasPrefix(resumePrefix) }
+            .map { root.appendingPathComponent($0, isDirectory: true) }
     }
 
     /// "1.2 GB", "340 MB", "12 KB".

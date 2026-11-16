@@ -99,7 +99,7 @@ private struct InspectionList: View {
                     Section("Selected part") {
                         LabeledContent("Name", value: part.name.isEmpty ? "(unnamed)" : part.name)
                         Text(part.id)
-                            .font(.caption)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                             .lineLimit(3)
                         LabeledContent("Size (W × D × H)", value: DisplayFormat.dimensions(part.size))
@@ -152,7 +152,7 @@ private struct InspectionList: View {
                 .font(.title3.monospacedDigit())
                 .padding(.top, 4)
             Text("Real size, width × depth × height")
-                .font(.caption)
+                .font(.footnote)
                 .foregroundStyle(.secondary)
 
             if percent < 100 {
@@ -200,7 +200,7 @@ private struct PartRow: View {
                         Text(part.name.isEmpty ? "(unnamed)" : part.name)
                             .lineLimit(1)
                         Text("\(DisplayFormat.count(part.triangleCount)) tris · \(DisplayFormat.dimensions(part.size))")
-                            .font(.caption.monospacedDigit())
+                            .font(.footnote.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }

@@ -412,7 +412,7 @@ struct ProjectPanelView: View {
                         .lineLimit(1)
                     if let size = model.size(of: item, in: unit) {
                         Text(DisplayFormat.dimensions(size))
-                            .font(.caption.monospacedDigit())
+                            .font(.footnote.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -518,13 +518,13 @@ struct ProjectPanelView: View {
                         .lineLimit(1)
                     if layer?.isLocked == true {
                         Image(systemName: "lock.fill")
-                            .font(.caption)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 6)
                     if project.layers.count > 1 {
                         Text(layer?.name ?? "No layer")
-                            .font(.caption)
+                            .font(.footnote)
                             .lineLimit(1)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)
@@ -695,7 +695,7 @@ struct ProjectPanelView: View {
                     .font(.headline)
                 Spacer(minLength: 8)
                 Text("Scale 1:\(DisplayFormat.scaleDenominator(percent: percent)) · Snap \(model.snapToFloor ? "on" : "off")")
-                    .font(.caption)
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }

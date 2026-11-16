@@ -85,8 +85,14 @@ struct HandState: Equatable {
 
     // MARK: Lifecycle
 
+    /// Who is using hand tracking right now ("stage", "rendered", "stream"). v0.9 audit F2: the
+    /// three immersive views share this service; a late `onDisappear` of the previous space must
+    /// not stop tracking for the space that just opened, so tracking stops only when no owner is left.
+    @ObservationIgnored private var owners: Set<String> = []
+
     /// Starts hand + world tracking. Idempotent: returns immediately if already running or starting.
-    func start() async {
+    func start(owner: String = "default") async {
+        owners.insert(owner)
         if status == .running || isStarting { return }
 
         guard HandTrackingProvider.isSupported else {
@@ -166,7 +172,9 @@ struct HandState: Equatable {
         }
     }
 
-    func stop() {
+    func stop(owner: String = "default") {
+        owners.remove(owner)
+        guard owners.isEmpty else { return }
         teardown(finalStatus: .idle)
     }
 

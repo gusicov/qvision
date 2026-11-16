@@ -12,38 +12,36 @@ struct StageView: View {
     @State private var updateSubscription: EventSubscription?
     @State private var attachmentState = StageAttachmentState()
     @State private var gestureState = StageGestureState()
-
-    private static let palmButtonID = "palmButton"
-
-    // Tuning (meters / seconds).
-    private static let palmButtonLift: Float = 0.06      // off the palm, toward the face
-    private static let palmButtonGrace: Float = 0.35     // stays tappable briefly after the palm turns
+    /// v0.9 D1: the palm menu shared with Rendered and Server.
+    @State private var palmState = PalmMenuState()
+    @State private var vignette = ComfortVignette()
 
     var body: some View {
         RealityView { content, attachments in
             content.add(model.stage.root)
             content.add(model.fly.indicator)
+            content.add(vignette.anchor)
 
-            if let button = attachments.entity(for: Self.palmButtonID) {
-                button.components.set(BillboardComponent())
-                button.isEnabled = false
-                content.add(button)
-                attachmentState.palmButton = button
+            if let menu = attachments.entity(for: PalmMenuPlacement.attachmentID) {
+                PalmMenuPlacement.install(menu, in: palmState)
+                content.add(menu)
             }
 
             let frameModel = model
-            let frameState = attachmentState
+            let frameState = palmState
+            let frameVignette = vignette
             updateSubscription?.cancel()
             updateSubscription = content.subscribe(to: SceneEvents.Update.self) { event in
                 MainActor.assumeIsolated {
-                    StageView.updateFrame(model: frameModel, state: frameState, deltaTime: Float(event.deltaTime))
+                    StageView.updateFrame(model: frameModel, state: frameState, vignette: frameVignette,
+                                          deltaTime: Float(event.deltaTime))
                 }
             }
         } update: { _, _ in
             // Everything dynamic is driven per frame by the SceneEvents.Update subscription.
         } attachments: {
-            Attachment(id: Self.palmButtonID) {
-                PalmPanelButton()
+            Attachment(id: PalmMenuPlacement.attachmentID) {
+                ProjectPalmMenu()
                     .environment(model)
             }
         }
@@ -52,7 +50,10 @@ struct StageView: View {
         .simultaneousGesture(rotateGesture)
         .simultaneousGesture(tapGesture)
         .task {
-            await model.hands.start()
+            await model.hands.start(owner: "stage")
+        }
+        .task {
+            await vignette.prepare()
         }
         .task {
             // Fallback: without hand tracking there's no hand panel, so bring the main window back.
@@ -61,7 +62,8 @@ struct StageView: View {
             openFallbackWindowIfNeeded()
         }
         .onDisappear {
-            model.hands.stop()
+            vignette.hide()
+            model.hands.stop(owner: "stage")
             updateSubscription?.cancel()
             updateSubscription = nil
         }
@@ -79,35 +81,17 @@ struct StageView: View {
     // MARK: - Per-frame update
 
     @MainActor
-    private static func updateFrame(model: AppModel, state: StageAttachmentState, deltaTime: Float) {
+    private static func updateFrame(model: AppModel, state: PalmMenuState, vignette: ComfortVignette, deltaTime: Float) {
         let dt = Swift.min(Swift.max(deltaTime, 0), 0.1)
         model.fly.update(deltaTime: dt, worldRoot: model.stage.worldRoot)
         let pose = model.hands.devicePose()
         // After fly mode moved worldRoot: sky dome + far ground re-centre on the head (L4).
         model.stage.updateFrame(devicePose: pose)
-        updateHandPanel(model: model, state: state, pose: pose, dt: dt)
-    }
-
-    @MainActor
-    private static func updateHandPanel(model: AppModel, state: StageAttachmentState, pose: simd_float4x4?, dt: Float) {
-        state.clock += dt
-
-        // 1. Palm button: visible while the LEFT palm faces the user (+ short grace to tap it).
-        if let button = state.palmButton {
-            let left = model.hands.left
-            if left.isTracked && left.palmFacingUser, let pose {
-                let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
-                var towardHead = head - left.palmCenter
-                let length = simd_length(towardHead)
-                towardHead = length > 0.001 ? towardHead / length : SIMD3<Float>(0, 1, 0)
-                button.setPosition(left.palmCenter + towardHead * palmButtonLift, relativeTo: nil)
-                if !button.isEnabled { button.isEnabled = true }
-                state.lastPalmSeen = state.clock
-            } else if button.isEnabled, state.clock - state.lastPalmSeen > palmButtonGrace {
-                button.isEnabled = false
-            }
-        }
-
+        vignette.update(speed: model.fly.currentSpeed, yawRate: model.fly.currentYawRate,
+                        enabled: model.comfortVignette && model.isFlyModeEnabled, deltaTime: dt)
+        // Palm menu: visible while the LEFT palm faces the user (+ a short grace to tap it).
+        PalmMenuPlacement.update(state: state, hands: model.hands, pose: pose, deltaTime: dt,
+                                 suppressed: model.fly.isFlying)
     }
 
     /// Head right vector flattened to XZ (column 0 of the device pose).
@@ -311,10 +295,6 @@ struct StageView: View {
 
 /// Entities of the RealityView attachments and hand-panel state, read by the per-frame update.
 final class StageAttachmentState {
-    var palmButton: Entity?
-    /// Accumulated frame time (s) and the last time the left palm faced the user.
-    var clock: Float = 0
-    var lastPalmSeen: Float = 0
     var didOpenFallbackWindow = false
 }
 
@@ -359,26 +339,25 @@ final class StageGestureState {
     }
 }
 
-// MARK: - Palm button
+// MARK: - Palm menu
 
-/// Small round button shown on the left palm; toggles the project panel.
-private struct PalmPanelButton: View {
+/// Home · Panel · Speed (+ Undo / Redo), on the left palm: the shared palm menu (v0.9 D1).
+private struct ProjectPalmMenu: View {
     @Environment(AppModel.self) private var model
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
+    @State private var isShowingSpeed = false
 
     var body: some View {
-        HStack(spacing: 8) {
-            // Undo / Redo right on the palm (L1).
-            Button {
-                model.undo()
-            } label: {
-                Image(systemName: "arrow.uturn.backward")
+        PalmMenuChrome {
+            PalmMenuButton(title: "Home", systemImage: "house", isDestructive: true) {
+                model.requestLeave()
             }
-            .disabled(!model.canUndo)
-            .accessibilityLabel("Undo")
+            .disabled(model.isTransitioning)
 
-            Button {
+            PalmMenuButton(title: model.isProjectPanelVisible ? "Hide panel" : "Panel",
+                           systemImage: "slider.horizontal.3",
+                           isOn: model.isProjectPanelVisible) {
                 if model.isProjectPanelVisible {
                     // Tell AppModel this is a palm hide, not "user closed the last window" (L6).
                     model.notePanelHideRequested()
@@ -386,24 +365,45 @@ private struct PalmPanelButton: View {
                 } else {
                     openWindow(id: AppModel.panelWindowID)
                 }
-            } label: {
-                Label(model.isProjectPanelVisible ? "Hide panel" : "Panel",
-                      systemImage: model.isProjectPanelVisible ? "xmark" : "slider.horizontal.3")
-                    .font(.headline)
-                    .padding(.horizontal, 6)
             }
-            .buttonStyle(.borderedProminent)
+
+            PalmMenuButton(title: "Speed \(DisplayFormat.multiplier(model.flySpeed))", systemImage: "hare",
+                           isOn: isShowingSpeed) {
+                isShowingSpeed.toggle()
+            }
+
+            // Undo / Redo right on the palm (L1).
+            Button {
+                model.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .frame(minWidth: 28, minHeight: 44)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.canUndo)
+            .accessibilityLabel("Undo")
 
             Button {
                 model.redo()
             } label: {
                 Image(systemName: "arrow.uturn.forward")
+                    .frame(minWidth: 28, minHeight: 44)
             }
+            .buttonStyle(.bordered)
             .disabled(!model.canRedo)
             .accessibilityLabel("Redo")
+        } expanded: {
+            if isShowingSpeed {
+                VStack(spacing: 8) {
+                    SpeedPresetRow(speed: model.flySpeed) { model.flySpeed = $0 }
+                    Toggle(isOn: Binding(get: { model.isFlyModeEnabled }, set: { model.isFlyModeEnabled = $0 })) {
+                        Label("Fly mode (both fists)", systemImage: "airplane")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .padding(.horizontal, 8)
+                }
+                .frame(width: 400)
+            }
         }
-        .buttonBorderShape(.capsule)
-        .padding(6)
-        .glassBackgroundEffect(in: Capsule())
     }
 }

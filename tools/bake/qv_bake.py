@@ -1038,6 +1038,19 @@ def blender_to_usd(v):
     return [v[0], v[2], -v[1]]
 
 
+def sidecar_viewpoints(cfg):
+    """Optional `viewpoints` config list -> sidecar entries (USD coords, floor level).
+    Each config entry: {"name", "position_blender": [x, y, floor_z], "look_at_blender": [x, y]}."""
+    out = []
+    for v in cfg.get('viewpoints', []):
+        p = v['position_blender']; t = v['look_at_blender']
+        yaw = math.degrees(math.atan2(-(t[0] - p[0]), t[1] - p[1]))
+        out.append({'name': v['name'],
+                    'position': [round(c, 3) for c in blender_to_usd([p[0], p[1], p[2] if len(p) > 2 else 0.0])],
+                    'yawDegrees': round(yaw, 1) + 0.0})
+    return out
+
+
 def floor_at(sc, x, y, z0=2.2):
     dg = bpy.context.evaluated_depsgraph_get()
     hit, loc, nrm, idx, ob, _ = sc.ray_cast(dg, Vector((x, y, z0)), Vector((0, 0, -1)), distance=10)
@@ -1196,6 +1209,7 @@ def stage_export(a, cfg):
         'start': {'position': [round(v, 3) for v in pos], 'yawDegrees': round(yaw, 1) + 0.0},
         'eyeHeightIncluded': False,
         'hasSky': bool(cfg.get('has_sky', False)),
+        'viewpoints': sidecar_viewpoints(cfg),
         'notes': ('baked with Blender %s Cycles: COMBINED diffuse+transmission+emission (no glossy), %d samples + OIDN; '
                   'AgX "%s", exposure %+.2f; sun elevation %.1f deg, azimuth %.1f deg (from scene +Y towards +X); '
                   'yawDegrees: rotation about +Y (counter-clockwise seen from above), 0 = facing -Z. '
