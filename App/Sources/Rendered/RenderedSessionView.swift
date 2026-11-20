@@ -29,8 +29,12 @@ struct RenderedSessionView: View {
                 VStack(alignment: .leading, spacing: 20) {
                     statusCard(viewer)
                     if viewer.isReady {
-                        viewpointsCard(viewer)
-                        speedCard(viewer)
+                        if viewer.isEnvironment {
+                            roomsCard(viewer)
+                        } else {
+                            viewpointsCard(viewer)
+                            speedCard(viewer)
+                        }
                         detailsCard(viewer)
                     }
                     exitButton(viewer)
@@ -96,7 +100,9 @@ struct RenderedSessionView: View {
                     }
                     .buttonStyle(.bordered)
                 }
-                Text("Clench both fists and move them to fly; turn them like a steering wheel to rotate. Turn your left palm toward you for Exit, Viewpoints and Speed.")
+                Text(viewer.isEnvironment
+                     ? "Look around and take a few steps: this room is made to be seen from where you stand. Turn your left palm toward you for Exit and the other rooms."
+                     : "Clench both fists and move them to fly; turn them like a steering wheel to rotate. Turn your left palm toward you for Exit, Viewpoints and Speed.")
                     .font(.subheadline)
                     .fixedSize(horizontal: false, vertical: true)
                 if model.hands.status != .running {
@@ -141,6 +147,15 @@ struct RenderedSessionView: View {
         default:
             return "Waiting for hand tracking…"
         }
+    }
+
+    /// E3: the other rooms of the Environment's group.
+    private func roomsCard(_ viewer: RenderedViewer) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionTitle(viewer.environmentGroup ?? "Rooms", systemImage: "door.left.hand.open")
+            RoomList()
+        }
+        .qvCard()
     }
 
     private func viewpointsCard(_ viewer: RenderedViewer) -> some View {

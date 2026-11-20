@@ -35,6 +35,13 @@ A *Rendered package* is `<Name>.usdz` (Y-up, metres, final lit colour baked into
 
 Budget per scene: about 1.5 M triangles, at most eight 4096² atlases, USDZ up to about 500 MB.
 
+### New in v0.10: Environments
+An **Environment** is a Rendered package for one room, baked to be seen from a small *viewing area* (a circle on the floor), following Apple's custom-environment workflow. Its sidecar adds `"kind": "environment"`, `group`, `order` and `viewingArea: { center, radiusMeters }` (see `docs/v0.10-ENVIRONMENTS.md`).
+- Home › Rendered › **Environments** lists them by group, in `order`. You can download one room or the whole group (one download at a time).
+- In the room there is no fist-fly: you look around and walk. More than about 1 m outside the viewing area, the room fades and "Step back to the centre" appears.
+- The palm menu shows **Exit · Rooms**. Choosing another room of the group fades out, unloads, loads the next and fades in.
+- Packages without `kind` behave exactly as before.
+
 ### New in v0.9
 - **Continue** card at the top of Home reopens the last project, rendered scene or server in one tap. Home opens on the tab you used last.
 - **Rendered tab** connects to the PC by itself and keeps trying while it is visible. Downloads resume after an interruption. A scene whose PC copy changed shows an **Update** badge. HD packages show an **HD** badge.

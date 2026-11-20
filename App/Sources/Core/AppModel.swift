@@ -1385,6 +1385,26 @@ final class AppModel {
         }
     }
 
+    /// v0.10 E3: another room of the same Environment group, inside the open rendered space:
+    /// fade out, unload, load, fade in (the space stays open).
+    func requestSwitchRoom(to next: RenderedScene) {
+        enqueueFlow { [weak self] in
+            guard let self else { return }
+            guard self.currentRenderedScene != nil, self.renderedState == .open else {
+                await self.performOpenRendered(next)
+                return
+            }
+            guard self.currentRenderedScene?.id != next.id else { return }
+            self.currentRenderedScene = next
+            if !self.isMainWindowOpen {
+                // The palm menu is in charge: don't run the main-window handoff again.
+                self.renderedHandedOffSceneID = next.id
+            }
+            self.noteOpened(.rendered, id: next.id, title: next.title)
+            self.rendered.switchRoom(to: next)
+        }
+    }
+
     /// Exit: closes the rendered space, releases the scene and shows Home › Rendered.
     func requestLeaveRendered() {
         guard currentRenderedScene != nil || renderedState != .closed else { return }

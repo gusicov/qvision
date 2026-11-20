@@ -67,6 +67,16 @@ final class RenderedViewer {
     /// v0.9 B3: the scene opened where the user left it last time (Start is one tap away).
     private(set) var resumedLastPosition = false
 
+    // v0.10 E3: Environment packages (`"kind": "environment"`).
+    /// The open scene is an Environment: no fist-fly, a viewing area, rooms instead of viewpoints.
+    private(set) var isEnvironment = false
+    /// Its group ("Tradition Place"); the palm menu lists the other rooms of it.
+    private(set) var environmentGroup: String? = nil
+    /// The user walked more than ~1 m beyond the viewing area: the scene fades, a hint shows.
+    private(set) var isOutsideViewingArea = false
+    /// Fading out to switch to another room.
+    private(set) var isSwitchingRoom = false
+
     /// Fist-fly speed multiplier (1...10, R4), remembered across launches.
     var speed: Float = 1 {
         didSet {
@@ -104,6 +114,21 @@ final class RenderedViewer {
     @ObservationIgnored private var poseSaveClock: Float = 0
     @ObservationIgnored private var lastSavedPose: SIMD4<Float>? = nil
     @ObservationIgnored private var sceneBounds: BoundingBox? = nil
+    /// Environments: viewing-area centre (placement space, floor level) and radius (m).
+    @ObservationIgnored private var viewingCenter: SIMD3<Float>? = nil
+    @ObservationIgnored private var viewingRadius: Float = 1.5
+    @ObservationIgnored private var areaOpacity: Float = 1
+    /// The next scene fades in when it is ready (room switch).
+    @ObservationIgnored private var fadeInWhenReady = false
+    @ObservationIgnored private var switchTask: Task<Void, Never>? = nil
+
+    /// Beyond `radius + outsideMargin` the scene starts to fade; it reaches `minAreaOpacity`
+    /// `fadeDistance` metres further.
+    private static let outsideMargin: Float = 1.0
+    private static let fadeDistance: Float = 1.0
+    private static let minAreaOpacity: Float = 0.12
+    /// Environment packages are budgeted at up to 12 atlases of 4096 px.
+    private static let maxEnvironmentFileBytes: Int64 = 3_000_000_000
     @ObservationIgnored private var lastHeadWorld: SIMD3<Float>? = nil
     /// Mirror of `phase == .ready` for the per-frame update (not observed).
     @ObservationIgnored private var frameReady = false
@@ -177,6 +202,12 @@ final class RenderedViewer {
         currentTarget = nil
         lastSavedPose = nil
         sceneBounds = nil
+        isEnvironment = false
+        environmentGroup = nil
+        isOutsideViewingArea = false
+        viewingCenter = nil
+        areaOpacity = 1
+        worldRoot.components.remove(OpacityComponent.self)
         scene = nil
         phase = .idle
         // The sky texture (shared cache) goes too: nothing of the scene stays in memory.
@@ -190,7 +221,8 @@ final class RenderedViewer {
             return
         }
         let fileBytes = RenderedFiles.fileSize(scene.usdzURL) ?? scene.sizeBytes
-        if fileBytes > Self.maxFileBytes {
+        let limit = scene.environment != nil ? Self.maxEnvironmentFileBytes : Self.maxFileBytes
+        if fileBytes > limit {
             fail("“\(scene.title)” is \(RenderedFiles.byteText(fileBytes)): too big for the headset. Re-bake it within the budget (USDZ up to about 500 MB, at most eight 4096 px atlases).", token: token)
             return
         }
@@ -233,7 +265,15 @@ final class RenderedViewer {
 
         // Start point + yaw (sidecar in USDZ coordinates -> placement space via the root transform).
         let rootMatrix = loaded.transform.matrix
-        if let start = sidecar?.startPosition {
+        let environmentMode = sidecar?.isEnvironment ?? false
+        if environmentMode, let center = sidecar?.viewingAreaCenter {
+            let c = rootMatrix * SIMD4<Float>(center.x, center.y, center.z, 1)
+            viewingCenter = SIMD3<Float>(c.x, c.y, c.z)
+        } else {
+            viewingCenter = nil
+        }
+        viewingRadius = sidecar?.viewingAreaRadius ?? 1.5
+        if let start = sidecar?.startPosition ?? (environmentMode ? sidecar?.viewingAreaCenter : nil) {
             let p = rootMatrix * SIMD4<Float>(start.x, start.y, start.z, 1)
             startPoint = SIMD3<Float>(p.x, p.y, p.z)
             let yaw = (sidecar?.startYawDegrees ?? 0) * .pi / 180
@@ -270,9 +310,10 @@ final class RenderedViewer {
             sky = dome
         }
 
-        // Viewpoints (D2): Start first, then the sidecar's named places.
+        // Viewpoints (D2): Start first, then the sidecar's named places (classic scenes only:
+        // an Environment is seen from its viewing area).
         var places = [Viewpoint(id: 0, name: "Start", point: startPoint, yaw: startYaw, atEyeHeight: startAtEyeHeight)]
-        for (index, viewpoint) in (sidecar?.usableViewpoints ?? []).enumerated() {
+        for (index, viewpoint) in (environmentMode ? [] : (sidecar?.usableViewpoints ?? [])).enumerated() {
             let p = rootMatrix * SIMD4<Float>(viewpoint.position.x, viewpoint.position.y, viewpoint.position.z, 1)
             let yaw = viewpoint.yawDegrees * .pi / 180
             let f = rootMatrix * SIMD4<Float>(-sin(yaw), 0, -cos(yaw), 0)
@@ -287,10 +328,20 @@ final class RenderedViewer {
         // B3: come back where the user was last time, if that is somewhere else than Start.
         var initial = places[0]
         resumedLastPosition = false
-        if let last = Self.loadLastPose(sceneID: scene.id, bounds: bounds, atEyeHeight: startAtEyeHeight),
+        if !environmentMode, let last = Self.loadLastPose(sceneID: scene.id, bounds: bounds, atEyeHeight: startAtEyeHeight),
            simd_distance(last.point, startPoint) > 0.5 {
             initial = last
             resumedLastPosition = true
+        }
+
+        isEnvironment = environmentMode
+        environmentGroup = environmentMode ? (sidecar?.groupName ?? "Environments") : nil
+
+        let fadeIn = fadeInWhenReady
+        fadeInWhenReady = false
+        if fadeIn {
+            fadeOpacity = 0
+            root.components.set(OpacityComponent(opacity: 0))
         }
 
         content = loaded
@@ -299,14 +350,50 @@ final class RenderedViewer {
         updateSky()
 
         fly.speed = speed
-        fly.isEnabled = true
+        // E3: no fist-fly in an Environment: you look around and walk.
+        fly.isEnabled = !environmentMode
         frameReady = true
         phase = .ready
+
+        if fadeIn {
+            fadeTask?.cancel()
+            fadeTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.fade(to: 1, seconds: 0.35)
+                guard !Task.isCancelled else { return }
+                self.clearFade()
+                self.isSwitchingRoom = false
+            }
+        } else {
+            isSwitchingRoom = false
+        }
+    }
+
+    /// E3: another room of the same group. Fade out, unload this one, load the next, fade in.
+    func switchRoom(to next: RenderedScene) {
+        guard scene?.id != next.id else { return }
+        switchTask?.cancel()
+        isSwitchingRoom = true
+        switchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if self.frameReady {
+                self.fadeTask?.cancel()
+                self.fadeTask = nil
+                await self.fade(to: 0, seconds: 0.3)
+            }
+            guard !Task.isCancelled else { return }
+            self.begin(next)
+            self.fadeInWhenReady = true
+            self.isSwitchingRoom = true
+        }
     }
 
     private func fail(_ message: String, token: Int) {
         guard token == loadToken else { return }
         frameReady = false
+        fadeInWhenReady = false
+        isSwitchingRoom = false
+        clearFade()
         phase = .failed(message)
     }
 
@@ -381,9 +468,33 @@ final class RenderedViewer {
         return Viewpoint(id: -1, name: "Last position", point: point, yaw: yaw, atEyeHeight: atEyeHeight)
     }
 
+    /// E3: fades the scene (worldRoot) while the user stands more than `outsideMargin` beyond the
+    /// viewing area, and raises `isOutsideViewingArea` for the "Step back to the centre" hint.
+    private func updateViewingArea(deltaTime: Float) {
+        guard let center = viewingCenter, let headWorld = lastHeadWorld else { return }
+        let head = placement.convert(position: headWorld, from: nil)
+        guard Self.isFinite(head) else { return }
+        let distance = simd_length(SIMD2<Float>(head.x - center.x, head.z - center.z))
+        let excess = distance - viewingRadius - Self.outsideMargin
+        let target: Float = excess <= 0 ? 1 : Swift.max(Self.minAreaOpacity, 1 - excess / Self.fadeDistance * (1 - Self.minAreaOpacity))
+        // Slow, smooth change (about half a second).
+        let blend = Swift.min(1, Swift.max(deltaTime, 0) * 2.5)
+        areaOpacity += (target - areaOpacity) * blend
+        if areaOpacity > 0.995 {
+            if worldRoot.components.has(OpacityComponent.self) {
+                areaOpacity = 1
+                worldRoot.components.remove(OpacityComponent.self)
+            }
+        } else {
+            worldRoot.components.set(OpacityComponent(opacity: areaOpacity))
+        }
+        let outside = excess > 0
+        if outside != isOutsideViewingArea { isOutsideViewingArea = outside }
+    }
+
     /// Stores where the user stands in the scene (placement space) and where they look.
     private func saveLastPose(force: Bool) {
-        guard let scene, content != nil, let pose = hands.devicePose() else { return }
+        guard let scene, content != nil, !isEnvironment, let pose = hands.devicePose() else { return }
         let head = SIMD3<Float>(pose.columns.3.x, pose.columns.3.y, pose.columns.3.z)
         let forward = -SIMD3<Float>(pose.columns.2.x, 0, pose.columns.2.z)
         guard Self.isFinite(head), simd_length(forward) > 0.05 else { return }
@@ -413,7 +524,11 @@ final class RenderedViewer {
                 place(target, devicePose: pose)
             }
         }
-        fly.update(deltaTime: deltaTime, worldRoot: worldRoot)
+        if isEnvironment {
+            updateViewingArea(deltaTime: deltaTime)
+        } else {
+            fly.update(deltaTime: deltaTime, worldRoot: worldRoot)
+        }
         updateSky()
 
         // Remember where the user is every couple of seconds (survives a crash or a force quit).

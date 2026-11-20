@@ -57,9 +57,32 @@ struct RenderedSidecar: Codable, Equatable {
         }
     }
 
+    /// v0.10 E1: the circle on the floor an Environment is designed to be seen from.
+    struct ViewingArea: Codable, Equatable {
+        var center: [Float]?
+        var radiusMeters: Float?
+
+        init(center: [Float]? = nil, radiusMeters: Float? = nil) {
+            self.center = center
+            self.radiusMeters = radiusMeters
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            center = try? c.decodeIfPresent([Float].self, forKey: .center)
+            radiusMeters = try? c.decodeIfPresent(Float.self, forKey: .radiusMeters)
+        }
+    }
+
     var title: String?
     var version: Int?
     var start: Start?
+    /// v0.10 E1: "environment" for a room-sized Environment package; missing = classic Rendered scene.
+    var kind: String?
+    /// Environments: the group they belong to ("Tradition Place") and their place in it.
+    var group: String?
+    var order: Int?
+    var viewingArea: ViewingArea?
     var eyeHeightIncluded: Bool?
     var notes: String?
     var hasSky: Bool?
@@ -107,6 +130,39 @@ struct RenderedSidecar: Codable, Equatable {
         hasSky = try? c.decodeIfPresent(Bool.self, forKey: .hasSky)
         shading = try? c.decodeIfPresent(String.self, forKey: .shading)
         viewpoints = try? c.decodeIfPresent([Viewpoint].self, forKey: .viewpoints)
+        kind = try? c.decodeIfPresent(String.self, forKey: .kind)
+        group = try? c.decodeIfPresent(String.self, forKey: .group)
+        if let whole = try? c.decodeIfPresent(Int.self, forKey: .order) {
+            order = whole
+        } else if let real = try? c.decodeIfPresent(Double.self, forKey: .order), real.isFinite {
+            order = Int(real)
+        }
+        viewingArea = try? c.decodeIfPresent(ViewingArea.self, forKey: .viewingArea)
+    }
+
+    /// v0.10: an Environment package (`"kind": "environment"`, case-insensitive).
+    var isEnvironment: Bool {
+        kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "environment"
+    }
+
+    /// The group name, trimmed ("Environments" when an environment has none).
+    var groupName: String {
+        let trimmed = group?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Environments" : trimmed
+    }
+
+    /// `viewingArea.center` if it is three finite numbers.
+    var viewingAreaCenter: SIMD3<Float>? {
+        guard let c = viewingArea?.center, c.count >= 3 else { return nil }
+        let v = SIMD3<Float>(c[0], c[1], c[2])
+        guard v.x.isFinite, v.y.isFinite, v.z.isFinite else { return nil }
+        return v
+    }
+
+    /// `viewingArea.radiusMeters`, clamped to something sensible (default 1.5 m).
+    var viewingAreaRadius: Float {
+        guard let r = viewingArea?.radiusMeters, r.isFinite, r > 0 else { return 1.5 }
+        return Swift.min(Swift.max(r, 0.3), 50)
     }
 
     /// `start.position` if it is three finite numbers.
@@ -193,10 +249,18 @@ struct RenderedScene: Identifiable, Hashable {
     /// From the sidecar: HD package (albedo x lightmap), number of named viewpoints.
     let isHD: Bool
     let viewpointCount: Int
+    /// v0.10: Environment packages (nil = classic Rendered scene).
+    let environment: EnvironmentInfo?
+
+    struct EnvironmentInfo: Hashable {
+        let group: String
+        let order: Int
+    }
 
     static func == (lhs: RenderedScene, rhs: RenderedScene) -> Bool {
         lhs.id == rhs.id && lhs.usdzURL == rhs.usdzURL && lhs.sizeBytes == rhs.sizeBytes && lhs.title == rhs.title
             && lhs.isHD == rhs.isHD && lhs.viewpointCount == rhs.viewpointCount && lhs.origin == rhs.origin
+            && lhs.environment == rhs.environment
     }
 
     func hash(into hasher: inout Hasher) {
@@ -302,7 +366,10 @@ enum RenderedFiles {
             addedAt: added,
             origin: origin,
             isHD: sidecar?.isHD ?? false,
-            viewpointCount: sidecar?.usableViewpoints.count ?? 0
+            viewpointCount: sidecar?.usableViewpoints.count ?? 0,
+            environment: (sidecar?.isEnvironment ?? false)
+                ? RenderedScene.EnvironmentInfo(group: sidecar?.groupName ?? "Environments", order: sidecar?.order ?? Int.max)
+                : nil
         )
     }
 

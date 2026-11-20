@@ -52,6 +52,10 @@ final class RenderedLibrary {
 
     /// Running downloads by library entry id.
     private(set) var downloads: [String: Download] = [:]
+    /// v0.10: "Download the whole group" queue (one download at a time), by entry id.
+    private(set) var queued: [String] = []
+    /// v0.10: sidecars of the PC's entries (tiny), so Environments can be grouped before download.
+    private(set) var remoteSidecars: [String: RenderedSidecar] = [:]
     /// Bytes already on this Vision Pro of interrupted downloads, by library entry id.
     private(set) var partials: [String: Int64] = [:]
 
@@ -72,6 +76,8 @@ final class RenderedLibrary {
     @ObservationIgnored private var indexTask: Task<Void, Never>? = nil
     @ObservationIgnored private var isFetchingIndex = false
     @ObservationIgnored private var lastSidecarSync: TimeInterval = 0
+    /// Which version of each entry's sidecar `remoteSidecars` holds ("modified|size").
+    @ObservationIgnored private var remoteSidecarKeys: [String: String] = [:]
 
     init() {
         let configuration = URLSessionConfiguration.default
@@ -235,6 +241,9 @@ final class RenderedLibrary {
                     throw RenderedError.message(Self.wrongProgramText(address))
                 }
                 let listed = decoded.filter { $0.file.lowercased().hasSuffix(".usdz") }
+                // Sidecars first, so a new Environment appears in its group straight away.
+                await self.fetchRemoteSidecars(listed, address: address)
+                try Task.checkCancellation()
                 if self.entries != listed { self.entries = listed }
                 self.libraryVersion = version
                 self.indexHost = address
@@ -354,13 +363,88 @@ final class RenderedLibrary {
             self.userCancelled.remove(id)
             self.downloads[id] = nil
             self.downloadTasks[id] = nil
+            self.queued.removeAll { $0 == id }
             self.refresh()
+            self.pumpQueue()
         }
     }
 
     func cancelDownload(_ id: String) {
+        queued.removeAll { $0 == id }
         userCancelled.insert(id)
         downloadTasks[id]?.cancel()
+    }
+
+    // MARK: - Environments (v0.10)
+
+    /// Environment scenes on this Vision Pro in `group`, by `order` then title.
+    func rooms(inGroup group: String?) -> [RenderedScene] {
+        guard let group else { return [] }
+        return scenes
+            .filter { $0.environment?.group == group }
+            .sorted { lhs, rhs in
+                let a = lhs.environment?.order ?? Int.max
+                let b = rhs.environment?.order ?? Int.max
+                return a != b ? a < b : lhs.title.localizedStandardCompare(rhs.title) == .orderedAscending
+            }
+    }
+
+    /// The PC entry's sidecar says it is an Environment.
+    func isEnvironment(_ entry: LibraryEntry) -> Bool {
+        remoteSidecars[entry.id]?.isEnvironment ?? false
+    }
+
+    /// Downloads every entry of `entries` that isn't on this Vision Pro or is out of date, one
+    /// after another (a group can be several GB; one transfer at a time keeps each one fast).
+    func downloadAll(_ entries: [LibraryEntry]) {
+        for entry in entries where !isUpToDate(entry) && downloads[entry.id] == nil && !queued.contains(entry.id) {
+            queued.append(entry.id)
+        }
+        pumpQueue()
+    }
+
+    func isQueued(_ id: String) -> Bool { queued.contains(id) }
+
+    private func pumpQueue() {
+        // One queued download at a time (single downloads started by hand run alongside).
+        guard !queued.contains(where: { downloads[$0] != nil }) else { return }
+        while let next = queued.first {
+            guard let entry = entries.first(where: { $0.id == next }), !isUpToDate(entry) else {
+                queued.removeFirst()
+                continue
+            }
+            download(entry)
+            return
+        }
+    }
+
+    private func fetchRemoteSidecars(_ listed: [LibraryEntry], address: String) async {
+        var sidecars = remoteSidecars
+        var changed = false
+        let ids = Set(listed.map(\.id))
+        for id in sidecars.keys where !ids.contains(id) {
+            sidecars[id] = nil
+            remoteSidecarKeys[id] = nil
+            changed = true
+        }
+        for entry in listed {
+            let key = "\(entry.modified ?? "")|\(entry.sizeBytes)"
+            guard remoteSidecarKeys[entry.id] != key else { continue }
+            guard let listedName = entry.sidecar, let name = RenderedFiles.safeFileName(listedName),
+                  let url = Self.fileURL(address: address, name: name) else {
+                remoteSidecarKeys[entry.id] = key
+                if sidecars[entry.id] != nil { sidecars[entry.id] = nil; changed = true }
+                continue
+            }
+            guard let data = try? await fetchData(url),
+                  let sidecar = try? JSONDecoder().decode(RenderedSidecar.self, from: data) else { continue }
+            remoteSidecarKeys[entry.id] = key
+            if sidecars[entry.id] != sidecar {
+                sidecars[entry.id] = sidecar
+                changed = true
+            }
+        }
+        if changed { remoteSidecars = sidecars }
     }
 
     var isDownloading: Bool { !downloads.isEmpty }

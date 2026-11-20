@@ -33,7 +33,10 @@ struct RenderedHomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     ContinueCard()
-                    localSection
+                    EnvironmentsSection()
+                    if !(classicScenes.isEmpty && hasEnvironments) {
+                        localSection
+                    }
                     pcSection
                     howToSection
                 }
@@ -137,6 +140,19 @@ struct RenderedHomeView: View {
 
     // MARK: - On this Vision Pro
 
+    /// v0.10: classic Rendered scenes (Environments have their own section above).
+    private var classicScenes: [RenderedScene] {
+        library.scenes.filter { $0.environment == nil }
+    }
+
+    private var classicEntries: [LibraryEntry] {
+        library.entries.filter { !library.isEnvironment($0) }
+    }
+
+    private var hasEnvironments: Bool {
+        library.scenes.contains { $0.environment != nil } || library.entries.contains { library.isEnvironment($0) }
+    }
+
     private var localSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionTitle("On this Vision Pro", systemImage: "visionpro") {
@@ -157,7 +173,7 @@ struct RenderedHomeView: View {
                 .qvCard(padding: 16)
             }
 
-            if library.scenes.isEmpty {
+            if classicScenes.isEmpty {
                 EmptyStateCard(
                     systemImage: "sparkles",
                     title: "No rendered scenes yet",
@@ -165,7 +181,7 @@ struct RenderedHomeView: View {
                 )
             } else {
                 LazyVGrid(columns: columns, spacing: 20) {
-                    ForEach(library.scenes) { scene in
+                    ForEach(classicScenes) { scene in
                         localCard(scene)
                     }
                 }
@@ -336,9 +352,14 @@ struct RenderedHomeView: View {
                     title: "The library is empty",
                     message: "Bake a scene on the PC (Bake-Rendered.cmd) or put <Name>.usdz with its .json and .jpg into the Rendered folder. It appears here by itself."
                 )
+            } else if classicEntries.isEmpty {
+                Text("Everything on your PC is an Environment: see Environments above.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .qvCard(padding: 16)
             } else {
                 VStack(spacing: 12) {
-                    ForEach(library.entries) { entry in
+                    ForEach(classicEntries) { entry in
                         RemoteEntryRow(entry: entry, address: library.indexHost ?? addressText)
                     }
                 }
@@ -490,7 +511,7 @@ struct QVBadge: View {
 }
 
 /// Progress bar with "312 MB of 480 MB · 65 %".
-private struct DownloadProgress: View {
+struct DownloadProgress: View {
     let download: RenderedLibrary.Download
 
     var body: some View {
