@@ -124,7 +124,7 @@ struct QuantitiesHomeView: View {
 
     private func localCard(_ package: LocalQuantityPackage) -> some View {
         let entry = library.entry(for: package)
-        let needsUpdate = entry.map { !library.isUpToDate($0) } ?? false
+        let needsUpdate = !package.hasPickData || (entry.map { !library.isUpToDate($0) } ?? false)
         let download = library.downloads[package.packageId]
         let isOpen = model.currentQuantities?.packageId == package.packageId
 
@@ -197,6 +197,10 @@ struct QuantitiesHomeView: View {
             }
             if isOpen, needsUpdate {
                 Text("Exit the open project to update it.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if !package.hasPickData, entry == nil {
+                Text("This download is from an older QVision. Connect to your PC and tap Update.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }

@@ -56,8 +56,12 @@ struct QuantitiesWindowView: View {
                     }
                 }
             case .loading(let text):
-                statusView(systemImage: nil, title: text,
-                           message: "Big projects take a while: the files are checked, then the model loads.")
+                // The elapsed seconds show the open is still moving.
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let seconds = session.loadStarted.map { Int(context.date.timeIntervalSince($0)) } ?? 0
+                    statusView(systemImage: nil, title: "\(text) \(seconds) s",
+                               message: "The files are checked, then the model loads.")
+                }
             case .failed(let message):
                 statusView(systemImage: "exclamationmark.triangle", title: "This project couldn't be opened",
                            message: message)

@@ -29,14 +29,16 @@ struct LocalQuantityPackage: Identifiable, Hashable, Sendable {
     let addedAt: Date
     /// The PC listing it was downloaded from (nil for a package copied by hand).
     let origin: QuantityIndexEntry?
+    /// v0.11.1 tap data (Data/pick.bin). Downloads from before v0.11.1 lack it and need an Update.
+    let hasPickData: Bool
 
     var id: String { packageId }
 }
 
 /// Quantity packages on this Vision Pro and on the PC (v0.11 Q1). Same behaviour as the
 /// Rendered library: progress, resume (HTTP Range, per file), Update when the PC's files changed.
-/// Every file is checked against the PC's SHA-256 before the package is put in place, and
-/// `AVQPackage.open(at:)` checks them again against the manifest when the project opens.
+/// Every file is checked against the PC's SHA-256 before the package is put in place;
+/// `AVQPackage.open(at:)` then only checks sizes (v0.11.1: no second hash on every open).
 @MainActor
 @Observable
 final class QuantityLibrary {
@@ -121,7 +123,8 @@ final class QuantityLibrary {
                 folder: folder,
                 sizeBytes: origin?.entry.sizeBytes ?? RenderedFiles.directorySize(folder),
                 addedAt: origin?.addedAt ?? Date(),
-                origin: origin?.entry
+                origin: origin?.entry,
+                hasPickData: QuantityPickIndex.isPresent(in: folder)
             ))
         }
         found.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -142,12 +145,13 @@ final class QuantityLibrary {
 
     /// Same files (by SHA-256) as the PC's listing.
     func isUpToDate(_ entry: QuantityIndexEntry) -> Bool {
-        guard let local = local(for: entry) else { return false }
+        guard let local = local(for: entry), local.hasPickData else { return false }
         guard let origin = local.origin else { return true }
         return origin.files == entry.files
     }
 
     func hasUpdate(_ package: LocalQuantityPackage) -> Bool {
+        if !package.hasPickData { return true }
         guard let entry = entry(for: package) else { return false }
         return !isUpToDate(entry)
     }

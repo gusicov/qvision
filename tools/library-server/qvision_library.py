@@ -23,7 +23,10 @@ manifest.json with "schemaVersion": 1 and a "packageId".
 GET /quantities.json -> [{ "folder", "packageId", "name", "files": {path: {"bytes", "sha256"}},
                         "sizeBytes", "modified" }]. "files" lists manifest.json plus the
                         manifest's files without Preview/ and Reference/ (the app doesn't
-                        need them). Hashes are computed here (cached by size and date).
+                        need them), and without the main per-element model (model.path; the
+                        headset shows the context model since v0.11.1), plus the pick data
+                        Data/pick.json + Data/pick.bin (tools/quantities/qv_pick.py) when present.
+                        Hashes are computed here (cached by size and date).
 GET /q/<folder>/<relative path> -> streams one listed member of a package (Range supported).
                         Only paths listed in "files" are served, so nothing can escape it.
 GET /              -> short plain-text status page.
@@ -54,6 +57,7 @@ DEFAULT_PORT = 8770
 LIBRARY_VERSION = 3
 QUANTITY_DEPTH = 3          # package folders up to this many levels below the Quantities folder
 QUANTITY_SKIP = ("Preview/", "Reference/")
+QUANTITY_EXTRA = ("Data/pick.json", "Data/pick.bin")   # written by qv_pick.py, not listed in the manifest
 QUANTITY_TYPES = {
     ".usdz": "model/vnd.usdz+zip",
     ".json": "application/json; charset=utf-8",
@@ -216,12 +220,17 @@ def quantity_package_dirs(root: str) -> list[tuple[str, str, dict]]:
     return found
 
 
-def quantity_members(manifest: dict) -> list[str]:
-    """Relative paths the app downloads: manifest.json + listed files minus Preview/ and Reference/."""
+def quantity_members(manifest: dict, package_dir: str) -> list[str]:
+    """Relative paths the app downloads: manifest.json + listed files minus Preview/, Reference/
+    and the main per-element model (when there is a context model), plus the pick data."""
+    model = manifest.get("model") if isinstance(manifest.get("model"), dict) else {}
+    skip_model = model.get("path") if model.get("contextPath") else None
     members = ["manifest.json"]
     for rel in sorted(manifest.get("files", {})):
-        if isinstance(rel, str) and safe_relative(rel) and not rel.startswith(QUANTITY_SKIP) \
-                and rel != "manifest.json":
+        if isinstance(rel, str) and safe_relative(rel) and not rel.startswith(QUANTITY_SKIP)                 and rel != "manifest.json" and rel != skip_model:
+            members.append(rel)
+    for rel in QUANTITY_EXTRA:
+        if rel not in members and os.path.isfile(os.path.join(package_dir, *rel.split("/"))):
             members.append(rel)
     return members
 
@@ -244,7 +253,7 @@ def build_quantities(root: str) -> list[dict]:
         total = 0
         newest = 0.0
         missing = None
-        for member in quantity_members(manifest):
+        for member in quantity_members(manifest, path):
             full = member_path(path, member)
             if full is None:
                 missing = member
@@ -279,7 +288,7 @@ def resolve_quantity_file(root: str, raw: str) -> str | None:
         if not rel.startswith(folder + "/"):
             continue
         member = rel[len(folder) + 1:]
-        if member not in quantity_members(manifest):
+        if member not in quantity_members(manifest, path):
             return None
         return member_path(path, member)
     return None

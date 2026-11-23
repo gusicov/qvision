@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 // Add this file and ArchViewerQuantities.swift to the same visionOS target.
@@ -125,6 +124,8 @@ struct AVQPackage: Sendable {
     let drawSelectionThroughContext: Bool
     let modelURL, hatchURL: URL
     let contextModelURL: URL?
+    /// The manifest's SHA-256 of the context model (pairs it with Data/pick.json).
+    let contextSHA256: String?
     let articles: [AVQArticle]
     let elements: [String: AVQElement]
     let layers: [String: AVQLayer]
@@ -154,11 +155,21 @@ struct AVQPackage: Sendable {
         }
         let manifest = try decoder.decode(Manifest.self, from: Data(contentsOf: url("manifest.json")))
         guard manifest.schemaVersion == 1 else { throw AVQPackageError("Unsupported package version") }
-        func checked(_ path: String) throws -> Data {
+        // QVision v0.11.1 (documented change to the provided file): every SHA-256 is checked once, when
+        // QuantityLibrary downloads the file. Opening only checks the listed size, so a big project
+        // isn't hashed again on every open.
+        func checkedSize(_ path: String) throws -> URL {
             guard let record = manifest.files[path] else { throw AVQPackageError("Unlisted file " + path) }
-            let data = try Data(contentsOf: url(path), options: .mappedIfSafe)
-            let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-            guard data.count == record.bytes, hash == record.sha256.lowercased() else {
+            let location = try url(path)
+            let size = (try? FileManager.default.attributesOfItem(atPath: location.path)[.size] as? NSNumber)?.intValue
+            guard size == record.bytes else {
+                throw AVQPackageError("File does not match this project revision: " + path)
+            }
+            return location
+        }
+        func checked(_ path: String) throws -> Data {
+            let data = try Data(contentsOf: checkedSize(path), options: .mappedIfSafe)
+            guard data.count == manifest.files[path]?.bytes else {
                 throw AVQPackageError("File does not match this project revision: " + path)
             }
             return data
@@ -182,12 +193,16 @@ struct AVQPackage: Sendable {
         let windows = try read(Masks.self, "Data/windowDepthMasks.json")
         let buffer = try checked("Data/geometry.bin")
         let texturePath = "Integration/Hatch.png"
-        _ = try checked(texturePath)
-        _ = try checked(manifest.model.path)
+        _ = try checkedSize(texturePath)
+        // v0.11.1: the main per-element model is no longer downloaded or opened on the headset
+        // (one entity per element is too heavy); the context model is shown instead.
         if let contextPath = manifest.model.contextPath {
-            _ = try checked(contextPath)
-            contextModelURL = try url(contextPath)
-        } else { contextModelURL = nil }
+            contextModelURL = try checkedSize(contextPath)
+            contextSHA256 = manifest.files[contextPath]?.sha256.lowercased()
+        } else {
+            contextModelURL = nil
+            contextSHA256 = nil
+        }
         guard [catalogue.schemaVersion, scene.schemaVersion, register.schemaVersion,
                reverse.schemaVersion, geometry.schemaVersion, windows.schemaVersion].allSatisfy({ $0 == 1 }),
               catalogue.packageId == manifest.packageId,
@@ -239,7 +254,7 @@ struct AVQPackage: Sendable {
         }
         self.packageId = catalogue.packageId
         drawSelectionThroughContext = manifest.presentation?.drawSelectionThroughContext ?? false
-        modelURL = try url(manifest.model.path)
+        modelURL = try url(manifest.model.path)   // not present on the headset since v0.11.1
         hatchURL = try url(texturePath)
         articles = catalogue.articles
         elements = elementIndex

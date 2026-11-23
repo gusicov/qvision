@@ -7,10 +7,12 @@ import UIKit
 
 /// The open quantities project (v0.11 Q2): one package in memory at a time.
 ///
-/// Scene graph: `root` → `placement` (the movable parent: position, yaw, scale) → the main USDZ
-/// (`building`), plus the selection overlay and the batched context that `ArchViewerQuantities`
-/// adds. Movement, rotation and scale only ever touch `placement`, so model, hatch and context
-/// stay together. The Move handle is a sibling of `placement` (it keeps its size).
+/// Scene graph: `root` → `placement` (the movable parent: position, yaw, scale) → the context USDZ
+/// (`building`, v0.11.1: one mesh per layer and material; the main per-element USDZ is never
+/// loaded on the headset), plus the selection overlay that `ArchViewerQuantities` adds.
+/// Movement, rotation and scale only ever touch `placement`, so model and hatch stay together.
+/// Taps find their element through `QuantityPickIndex` (Data/pick.bin). The Move handle is a
+/// sibling of `placement` (it keeps its size).
 @MainActor
 @Observable
 final class QuantitiesSession {
@@ -81,6 +83,8 @@ final class QuantitiesSession {
     }
 
     private(set) var phase: Phase = .idle
+    /// When the current open started (the window shows the elapsed seconds while loading).
+    private(set) var loadStarted: Date? = nil
     private(set) var packageID: String? = nil
     private(set) var title: String = ""
     private(set) var viewer: ArchViewerQuantities? = nil
@@ -115,6 +119,7 @@ final class QuantitiesSession {
     @ObservationIgnored private var loadTask: Task<Void, Never>? = nil
     @ObservationIgnored private var collisionTask: Task<Void, Never>? = nil
     @ObservationIgnored private var tapToken = 0
+    @ObservationIgnored private var pick: QuantityPickIndex? = nil
 
     // Placement (the parent's pose). Model space: base centred on the origin, metres.
     @ObservationIgnored private var position = SIMD3<Float>(0, 0.9, -1)
@@ -167,6 +172,7 @@ final class QuantitiesSession {
         let token = generation
         packageID = package.packageId
         title = package.name
+        loadStarted = Date()
         phase = .loading("Checking the project files…")
         loadTask = Task { @MainActor [weak self] in
             await self?.load(package, token: token)
@@ -189,6 +195,7 @@ final class QuantitiesSession {
         building = nil
         grabVolume = nil
         layerEntities = [:]
+        pick = nil
         articleIndex = [:]
         layerToggles = []
         togglesAreBuildings = false
@@ -201,6 +208,7 @@ final class QuantitiesSession {
         handle.isEnabled = false
         packageID = nil
         title = ""
+        loadStarted = nil
         phase = .idle
     }
 
@@ -209,15 +217,15 @@ final class QuantitiesSession {
         do {
             let package = try await AVQPackage.open(at: local.folder)
             guard token == generation else { return }
-            phase = .loading("Loading the model…")
-            let building = try await Entity(contentsOf: package.modelURL)
-            guard token == generation else { return }
-            var context: Entity? = nil
-            if let url = package.contextModelURL {
-                phase = .loading("Loading the context…")
-                context = try? await Entity(contentsOf: url)
-                guard token == generation else { return }
+            guard let contextURL = package.contextModelURL else {
+                throw AVQPackageError("This project has no context model, which QVision shows on the headset.")
             }
+            let pickIndex = try await QuantityPickIndex.load(folder: local.folder, package: package)
+            guard token == generation else { return }
+            // v0.11.1: the context model (one mesh per layer and material) is the building.
+            phase = .loading("Loading the model…")
+            let building = try await Entity(contentsOf: contextURL)
+            guard token == generation else { return }
 
             // Base centred on the placement origin (keeps the USDZ root's own rotation / scale).
             placement.isEnabled = false
@@ -231,7 +239,7 @@ final class QuantitiesSession {
             }
             phase = .loading("Preparing the quantities…")
             let viewer = try await ArchViewerQuantities(package: package, building: building,
-                                                        placement: placement, reviewContext: context)
+                                                        placement: placement, reviewContext: nil)
             guard token == generation else {
                 viewer.detach()
                 building.removeFromParent()
@@ -253,17 +261,20 @@ final class QuantitiesSession {
 
             self.building = building
             self.viewer = viewer
-            hasContext = context != nil
+            self.pick = pickIndex
+            hasContext = false
             placeInFrontOfUser(resetYaw: true)
             placement.isEnabled = true
             handle.isEnabled = true
             phase = .ready
+            loadStarted = nil
             startCollisions(building: building, token: token)
         } catch is CancellationError {
             if token == generation { loadedBuilding?.removeFromParent() }
         } catch {
             guard token == generation else { return }
             loadedBuilding?.removeFromParent()
+            loadStarted = nil
             phase = .failed(error.localizedDescription)
         }
     }
@@ -528,6 +539,22 @@ final class QuantitiesSession {
         var elementId = viewer.element(forHit: entity)?.elementId
         var part: AVQPart? = nil
         var ties = 0
+        if !onOverlay, elementId == nil, let pick {
+            // The context mesh under the tap -> its nearest triangle in Data/pick.bin -> the element.
+            let point = building.convert(position: scenePoint, from: nil)
+            var names: [String] = []
+            var node: Entity? = entity
+            while let current = node, current !== building {
+                names.append(current.name)
+                node = current.parent
+            }
+            let meshNames = names
+            let found = await Task.detached(priority: .userInitiated) {
+                pick.element(meshNames: meshNames, point: point)
+            }.value
+            guard token == tapToken, self.viewer === viewer else { return }
+            elementId = found
+        }
         if onOverlay, viewer.selection != nil {
             let point = building.convert(position: scenePoint, from: nil)
             if let parts = try? await viewer.parts(atProjectPoint: point), let first = parts.first {
@@ -592,48 +619,50 @@ final class QuantitiesSession {
 
     // MARK: - Collision shapes for picking
 
-    /// Per-mesh collision shapes, generated in batches after the model shows (never blocking
-    /// the first frame): an exact static mesh for small meshes while the triangle budget lasts,
-    /// a box from the mesh bounds otherwise.
+    /// Static mesh collision shapes for the context meshes (about 500-600), generated in batches
+    /// after the model shows; the window shows "Preparing taps N %" meanwhile. The exact element
+    /// comes from Data/pick.bin, so the shape only has to say which mesh and where.
     private func startCollisions(building: Entity, token: Int) {
         collisionTask?.cancel()
         pickingProgress = 0
         collisionTask = Task { @MainActor [weak self] in
-            var meshes: [Entity] = []
+            var meshes: [(Entity, Int)] = []
+            var total = 0
             var stack = [building]
             while let node = stack.popLast() {
-                if node.components.has(ModelComponent.self) { meshes.append(node) }
+                if let model = node.components[ModelComponent.self] {
+                    let count = Swift.max(Self.triangleCount(model.mesh), 1)
+                    meshes.append((node, count))
+                    total += count
+                }
                 stack.append(contentsOf: node.children)
             }
             // Let the model draw first.
             try? await Task.sleep(nanoseconds: 300_000_000)
-            var budget = 400_000
-            var index = 0
-            let batch = 120
-            while index < meshes.count {
+            var done = 0
+            var batchTriangles = 0
+            for (entity, count) in meshes {
                 guard let self, self.generation == token, !Task.isCancelled else { return }
-                let end = Swift.min(index + batch, meshes.count)
-                for entity in meshes[index..<end] {
-                    guard let model = entity.components[ModelComponent.self],
-                          !entity.components.has(CollisionComponent.self) else { continue }
+                if let model = entity.components[ModelComponent.self], !entity.components.has(CollisionComponent.self) {
                     let mesh = model.mesh
-                    let bounds = mesh.bounds
-                    guard !bounds.isEmpty else { continue }
-                    var shape: ShapeResource? = nil
-                    let triangles = Self.triangleCount(mesh)
-                    if triangles > 0, triangles <= 1_500, triangles <= budget,
-                       let exact = try? await ShapeResource.generateStaticMesh(from: mesh) {
+                    if let shape = try? await ShapeResource.generateStaticMesh(from: mesh) {
                         guard self.generation == token else { return }
-                        shape = exact
-                        budget -= triangles
+                        entity.components.set(CollisionComponent(shapes: [shape]))
+                    } else if !mesh.bounds.isEmpty {
+                        let bounds = mesh.bounds
+                        entity.components.set(CollisionComponent(shapes: [
+                            ShapeResource.generateBox(size: simd_max(bounds.extents, SIMD3<Float>(repeating: 0.002)))
+                                .offsetBy(translation: bounds.center)
+                        ]))
                     }
-                    let fallback = ShapeResource.generateBox(size: simd_max(bounds.extents, SIMD3<Float>(repeating: 0.002)))
-                        .offsetBy(translation: bounds.center)
-                    entity.components.set(CollisionComponent(shapes: [shape ?? fallback]))
                 }
-                index = end
-                self.pickingProgress = Double(index) / Double(Swift.max(meshes.count, 1))
-                try? await Task.sleep(nanoseconds: 8_000_000)
+                done += count
+                batchTriangles += count
+                if batchTriangles >= 60_000 {
+                    batchTriangles = 0
+                    self.pickingProgress = Double(done) / Double(Swift.max(total, 1))
+                    try? await Task.sleep(nanoseconds: 8_000_000)
+                }
             }
             guard let self, self.generation == token else { return }
             self.grabVolume?.removeFromParent()
