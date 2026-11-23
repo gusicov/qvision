@@ -49,8 +49,8 @@ final class QuantityPickIndex: @unchecked Sendable {
 
         func cellOf(_ p: SIMD3<Float>) -> SIMD3<Int32> {
             var f = ((p - lower) / cell).rounded(.down)
-            f.replace(with: .zero, where: .!(f .== f))   // NaN
-            f = f.clamped(lowerBound: .zero, upperBound: SIMD3<Float>(dims &- 1))
+            f.replace(with: Float(0), where: .!(f .== f))   // NaN
+            f = f.clamped(lowerBound: SIMD3<Float>(repeating: 0), upperBound: SIMD3<Float>(dims &- 1))
             return SIMD3<Int32>(f)
         }
     }
