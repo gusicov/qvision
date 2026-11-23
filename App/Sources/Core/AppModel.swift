@@ -26,10 +26,13 @@ final class AppModel {
     static let panelWindowID = "panel"
     /// v0.8: the Rendered viewer (one baked scene, unlit, full immersion).
     static let renderedSpaceID = "rendered"
+    /// v0.11: the Quantities model (mixed, table-top) and its window (article panel).
+    static let quantitiesSpaceID = "quantities"
+    static let quantitiesWindowID = "quantities-window"
 
-    /// The tabs of Home (v0.8 R1).
+    /// The tabs of Home (v0.8 R1; Quantities v0.11).
     enum HomeTab: String, Hashable {
-        case projects, rendered, server, settings
+        case projects, rendered, server, quantities, settings
     }
 
     /// v0.9 B1: the last thing opened, for the Continue card on Home.
@@ -287,6 +290,17 @@ final class AppModel {
     /// (only one ImmersiveSpace can be open). Set by RootView.
     @ObservationIgnored private weak var server: ServerSessionController? = nil
 
+    // MARK: v0.11 state (Quantities)
+
+    /// The open quantities project (observable itself: phase, selection, visibility).
+    @ObservationIgnored let quantities: QuantitiesSession
+    /// The "quantities" ImmersiveSpace, kept in sync by the serialized flow.
+    var quantitiesState: StageState = .closed
+    /// The package the quantities space shows; nil = not in Quantities.
+    private(set) var currentQuantities: LocalQuantityPackage? = nil
+    var isQuantitiesWindowOpen: Bool = false
+    @ObservationIgnored private var quantitiesWindowDismissExpectedUntil: TimeInterval = 0
+
     @ObservationIgnored private let store = ProjectStore()
     @ObservationIgnored private var pendingSave: Task<Void, Never>? = nil
 
@@ -304,6 +318,7 @@ final class AppModel {
         self.hands = handService
         self.fly = FlyController(hands: handService)
         self.rendered = RenderedViewer(hands: handService)
+        self.quantities = QuantitiesSession(hands: handService)
         self.projects = store.loadAll()
 
         let stored = UserDefaults.standard.object(forKey: Self.flySpeedDefaultsKey) as? Double
@@ -1247,8 +1262,9 @@ final class AppModel {
 
     private func performOpen(_ id: UUID) async {
         guard let project = projects.first(where: { $0.id == id }) else { return }
-        // Only one ImmersiveSpace at a time (v0.8): rendered scene and stream go first.
+        // Only one ImmersiveSpace at a time (v0.8): rendered scene, quantities and stream go first.
         await closeRenderedSpace()
+        await leaveQuantitiesForAnotherSpace()
         await endStreamIfNeeded()
 
         // Double tap / already open: just make sure the stage is there.
@@ -1416,10 +1432,12 @@ final class AppModel {
     /// Server tab: before connecting, close the stage or the rendered space (serialized).
     func releaseImmersiveSpacesForStream() async {
         guard currentRenderedScene != nil || renderedState != .closed
-                || currentProject != nil || stageState != .closed else { return }
+                || currentProject != nil || stageState != .closed
+                || currentQuantities != nil || quantitiesState != .closed else { return }
         await enqueueFlow { [weak self] in
             guard let self else { return }
             await self.closeRenderedSpace()
+            await self.leaveQuantitiesForAnotherSpace()
             if self.currentProject != nil || self.stageState != .closed {
                 await self.performLeave(toHome: true)
             }
@@ -1453,6 +1471,7 @@ final class AppModel {
         if currentProject != nil || stageState != .closed {
             await performLeave(toHome: true)
         }
+        await leaveQuantitiesForAnotherSpace()
         await endStreamIfNeeded()
         // Another rendered scene is open: close it first (one scene in memory at a time).
         if currentRenderedScene != nil || renderedState != .closed {
@@ -1576,6 +1595,186 @@ final class AppModel {
         }
     }
 
+    // MARK: - Quantities flow (v0.11, L6 rules)
+
+    /// Opens a quantity package in the mixed "quantities" space and shows the quantities window
+    /// (serialized). A project, a rendered scene or a stream closes first. With another package
+    /// already open, the space stays and the project is switched in place.
+    func requestOpenQuantities(_ package: LocalQuantityPackage) {
+        enqueueFlow { [weak self] in
+            await self?.performOpenQuantities(package)
+        }
+    }
+
+    /// Exit: closes the window and the space, releases the package and shows Home › Quantities.
+    func requestLeaveQuantities() {
+        guard currentQuantities != nil || quantitiesState != .closed || isQuantitiesWindowOpen else { return }
+        enqueueFlow { [weak self] in
+            await self?.performLeaveQuantities(toHome: true)
+        }
+    }
+
+    func quantitiesDidAppear() {
+        quantitiesState = .open
+    }
+
+    /// The space went away. If that wasn't our own Exit (Digital Crown, system), leave cleanly.
+    func quantitiesDidDisappear() {
+        quantitiesState = .closed
+        guard !isTransitioning, currentQuantities != nil else { return }
+        requestLeaveQuantities()
+    }
+
+    func quantitiesWindowDidAppear() {
+        isQuantitiesWindowOpen = true
+    }
+
+    /// The user closed the quantities window: leave the project (the model goes too). Home only
+    /// comes back if it is still open.
+    func quantitiesWindowDidDisappear() {
+        isQuantitiesWindowOpen = false
+        let expected = ProcessInfo.processInfo.systemUptime < quantitiesWindowDismissExpectedUntil
+        quantitiesWindowDismissExpectedUntil = 0
+        guard !expected, currentQuantities != nil, !isTransitioning else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard let self, self.currentQuantities != nil, !self.isTransitioning,
+                  !self.isQuantitiesWindowOpen else { return }
+            self.enqueueFlow { [weak self] in
+                await self?.performLeaveQuantities(toHome: false)
+            }
+        }
+    }
+
+    /// The quantities window closes on its own (no package open, e.g. restored at launch).
+    func noteQuantitiesWindowDismissRequested() {
+        quantitiesWindowDismissExpectedUntil = ProcessInfo.processInfo.systemUptime + 2
+    }
+
+    private func performOpenQuantities(_ package: LocalQuantityPackage) async {
+        if currentProject != nil || stageState != .closed {
+            await performLeave(toHome: true)
+        }
+        await closeRenderedSpace()
+        await endStreamIfNeeded()
+        homeTab = .quantities
+
+        if currentQuantities != nil, quantitiesState == .open {
+            // Switch in place (or just bring the window back for the same project).
+            var failed = false
+            if case .failed = quantities.phase { failed = true }
+            if failed || currentQuantities?.packageId != package.packageId || quantities.packageID != package.packageId {
+                currentQuantities = package
+                quantities.begin(package)
+            }
+            showQuantitiesWindow()
+            return
+        }
+        if currentQuantities != nil || quantitiesState != .closed {
+            await closeQuantitiesSpace()
+        }
+        currentQuantities = package
+        quantities.begin(package)
+        await syncQuantities()
+        guard currentQuantities != nil, quantitiesState == .open else {
+            currentQuantities = nil
+            quantities.release()
+            return
+        }
+        showQuantitiesWindow()
+    }
+
+    /// Opens the quantities window and hands Home over to it (the window has Exit).
+    private func showQuantitiesWindow() {
+        guard let actions = sceneActions else { return }
+        if !isQuantitiesWindowOpen {
+            actions.openWindow(id: Self.quantitiesWindowID)
+        }
+        if isMainWindowOpen {
+            noteMainWindowDismissRequested()
+            actions.dismissWindow(id: Self.mainWindowID)
+        }
+    }
+
+    private func performLeaveQuantities(toHome: Bool) async {
+        homeTab = .quantities
+        if toHome, !isMainWindowOpen, let actions = sceneActions {
+            actions.openWindow(id: Self.mainWindowID)
+        }
+        if isQuantitiesWindowOpen, let actions = sceneActions {
+            noteQuantitiesWindowDismissRequested()
+            actions.dismissWindow(id: Self.quantitiesWindowID)
+        }
+        await closeQuantitiesSpace()
+    }
+
+    /// Another mode needs the one immersive space: close the quantities window and space.
+    private func leaveQuantitiesForAnotherSpace() async {
+        guard currentQuantities != nil || quantitiesState != .closed || isQuantitiesWindowOpen else { return }
+        if isQuantitiesWindowOpen, let actions = sceneActions {
+            noteQuantitiesWindowDismissRequested()
+            actions.dismissWindow(id: Self.quantitiesWindowID)
+        }
+        await closeQuantitiesSpace()
+    }
+
+    /// Dismisses the quantities space (if open) and releases the package.
+    private func closeQuantitiesSpace() async {
+        currentQuantities = nil
+        if quantitiesState != .closed {
+            await syncQuantities()
+        }
+        quantities.release()
+    }
+
+    /// Opens / dismisses the quantities space until it matches `currentQuantities`. Only called
+    /// from flow operations, so never concurrently.
+    private func syncQuantities() async {
+        guard let actions = sceneActions else {
+            if currentQuantities != nil {
+                currentQuantities = nil
+                lastError = "The quantities view couldn't be opened. Try again."
+            }
+            return
+        }
+        for _ in 0..<12 {
+            let wantsSpace = currentQuantities != nil
+            switch (wantsSpace, quantitiesState) {
+            case (true, .closed):
+                quantitiesState = .transitioning
+                let result = await actions.openImmersiveSpace(id: Self.quantitiesSpaceID)
+                switch result {
+                case .opened:
+                    quantitiesState = .open
+                case .userCancelled:
+                    quantitiesState = .closed
+                    currentQuantities = nil
+                    return
+                case .error:
+                    quantitiesState = .closed
+                    currentQuantities = nil
+                    lastError = "The quantities view couldn't be opened. Close any other immersive view (a project, a rendered scene or a server stream) and try again."
+                    return
+                @unknown default:
+                    quantitiesState = .closed
+                    currentQuantities = nil
+                    return
+                }
+
+            case (false, .open):
+                quantitiesState = .transitioning
+                await actions.dismissImmersiveSpace()
+                quantitiesState = .closed
+
+            case (_, .transitioning):
+                try? await Task.sleep(nanoseconds: 200_000_000)
+
+            default:
+                return
+            }
+        }
+        if quantitiesState == .transitioning { quantitiesState = .closed }
+    }
 
     // MARK: - Private helpers
 

@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Root of the main window.
 ///
-/// - No project open: Home (Projects + Server tabs).
+/// - No project open: Home (Projects · Rendered · Server · Quantities · Settings tabs).
 /// - Project open: the project panel in window form. As soon as the stage is open and hand
 ///   tracking runs, the panel window opens and the main window closes (once per project open).
 ///   If hand tracking never runs (denied / unsupported), the main window stays as the panel.
@@ -70,6 +70,9 @@ struct RootView: View {
                     ServerHomeView()
                         .tabItem { Label("Server", systemImage: "server.rack") }
                         .tag(AppModel.HomeTab.server)
+                    QuantitiesHomeView()
+                        .tabItem { Label("Quantities", systemImage: "ruler") }
+                        .tag(AppModel.HomeTab.quantities)
                     SettingsView()
                         .tabItem { Label("Settings", systemImage: "gearshape") }
                         .tag(AppModel.HomeTab.settings)

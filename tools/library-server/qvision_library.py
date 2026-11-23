@@ -15,7 +15,17 @@ GET /files/<name>  -> streams one file of that folder (usdz, json, jpg/jpeg/png)
                       Names are matched against the folder listing, so no path can escape it.
                       Supports a single "Range: bytes=N-" / "bytes=N-M" / "bytes=-N" (206), so an
                       interrupted download can resume.
-GET /health        -> { "name": "QVision Library", "version": 2, "scenes": N }
+GET /health        -> { "name": "QVision Library", "version": 3, "scenes": N, "quantities": N }
+
+Quantity packages (v0.11), served from a second folder (default: "Quantities" next to the
+Rendered folder, or --quantities). A package is any folder up to 3 levels deep holding a
+manifest.json with "schemaVersion": 1 and a "packageId".
+GET /quantities.json -> [{ "folder", "packageId", "name", "files": {path: {"bytes", "sha256"}},
+                        "sizeBytes", "modified" }]. "files" lists manifest.json plus the
+                        manifest's files without Preview/ and Reference/ (the app doesn't
+                        need them). Hashes are computed here (cached by size and date).
+GET /q/<folder>/<relative path> -> streams one listed member of a package (Range supported).
+                        Only paths listed in "files" are served, so nothing can escape it.
 GET /              -> short plain-text status page.
 
 Only clients with a private / loopback / link-local address are served (LAN only); everyone
@@ -28,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import ipaddress
 import json
 import os
@@ -40,7 +51,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DEFAULT_FOLDER = r"C:\All Docs\06_Apple vision pro\assets\Rendered"
 DEFAULT_PORT = 8770
-LIBRARY_VERSION = 2
+LIBRARY_VERSION = 3
+QUANTITY_DEPTH = 3          # package folders up to this many levels below the Quantities folder
+QUANTITY_SKIP = ("Preview/", "Reference/")
+QUANTITY_TYPES = {
+    ".usdz": "model/vnd.usdz+zip",
+    ".json": "application/json; charset=utf-8",
+    ".bin": "application/octet-stream",
+    ".png": "image/png",
+}
 CHUNK = 1024 * 1024  # 1 MiB per write while streaming
 
 SERVED_TYPES = {
@@ -138,6 +157,134 @@ def build_index(folder: str) -> list[dict]:
     return index
 
 
+_hash_lock = threading.Lock()
+_hash_cache: dict[str, tuple[int, int, str]] = {}   # path -> (size, mtime_ns, sha256)
+
+
+def file_sha256(path: str, stat: os.stat_result) -> str:
+    key = os.path.normcase(path)
+    with _hash_lock:
+        cached = _hash_cache.get(key)
+    if cached and cached[0] == stat.st_size and cached[1] == stat.st_mtime_ns:
+        return cached[2]
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(CHUNK), b""):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    with _hash_lock:
+        _hash_cache[key] = (stat.st_size, stat.st_mtime_ns, value)
+    return value
+
+
+def safe_relative(path: str) -> bool:
+    """A forward-slash relative path without empty, '.', '..' or drive/stream parts."""
+    if not path or path.startswith("/") or "\\" in path or ":" in path or "\x00" in path:
+        return False
+    return all(part not in ("", ".", "..") for part in path.split("/"))
+
+
+def quantity_package_dirs(root: str) -> list[tuple[str, str, dict]]:
+    """(folder relative to root with '/', absolute path, manifest) of every package."""
+    found: list[tuple[str, str, dict]] = []
+    if not root:
+        return found
+    base = os.path.realpath(root)
+    if not os.path.isdir(base):
+        return found
+
+    def walk(path: str, rel: str, depth: int) -> None:
+        manifest_path = os.path.join(path, "manifest.json")
+        if rel and os.path.isfile(manifest_path):
+            manifest = read_sidecar(manifest_path)
+            if (manifest and manifest.get("schemaVersion") == 1 and isinstance(manifest.get("packageId"), str)
+                    and isinstance(manifest.get("files"), dict)):
+                found.append((rel, path, manifest))
+                return
+        if depth >= QUANTITY_DEPTH:
+            return
+        try:
+            with os.scandir(path) as entries:
+                children = sorted(e.name for e in entries
+                                  if e.is_dir(follow_symlinks=False) and not e.name.startswith("."))
+        except OSError:
+            return
+        for name in children:
+            walk(os.path.join(path, name), f"{rel}/{name}" if rel else name, depth + 1)
+
+    walk(base, "", 0)
+    return found
+
+
+def quantity_members(manifest: dict) -> list[str]:
+    """Relative paths the app downloads: manifest.json + listed files minus Preview/ and Reference/."""
+    members = ["manifest.json"]
+    for rel in sorted(manifest.get("files", {})):
+        if isinstance(rel, str) and safe_relative(rel) and not rel.startswith(QUANTITY_SKIP) \
+                and rel != "manifest.json":
+            members.append(rel)
+    return members
+
+
+def member_path(package_dir: str, rel: str) -> str | None:
+    """Absolute path of a member, re-checked to sit inside the package folder."""
+    if not safe_relative(rel):
+        return None
+    base = os.path.realpath(package_dir)
+    path = os.path.realpath(os.path.join(base, *rel.split("/")))
+    if not path.startswith(base + os.sep) or not os.path.isfile(path):
+        return None
+    return path
+
+
+def build_quantities(root: str) -> list[dict]:
+    index: list[dict] = []
+    for rel, path, manifest in quantity_package_dirs(root):
+        files: dict[str, dict] = {}
+        total = 0
+        newest = 0.0
+        missing = None
+        for member in quantity_members(manifest):
+            full = member_path(path, member)
+            if full is None:
+                missing = member
+                break
+            stat = os.stat(full)
+            files[member] = {"bytes": stat.st_size, "sha256": file_sha256(full, stat)}
+            total += stat.st_size
+            newest = max(newest, stat.st_mtime)
+        if missing:
+            log(f"Quantities: skipping {rel} ({missing} is missing)")
+            continue
+        name = manifest.get("projectName")
+        index.append({
+            "folder": rel,
+            "packageId": manifest["packageId"],
+            "name": name.strip() if isinstance(name, str) and name.strip() else manifest["packageId"],
+            "files": files,
+            "sizeBytes": total,
+            "modified": iso_utc(newest),
+        })
+    index.sort(key=lambda e: e["name"].lower())
+    return index
+
+
+def resolve_quantity_file(root: str, raw: str) -> str | None:
+    """'<folder>/<relative path>' (after '/q/') -> an absolute member path, or None."""
+    rel = urllib.parse.unquote(raw)
+    if not safe_relative(rel):
+        return None
+    # Longest package folder first, so nested names can't shadow each other.
+    for folder, path, manifest in sorted(quantity_package_dirs(root), key=lambda p: -len(p[0])):
+        if not rel.startswith(folder + "/"):
+            continue
+        member = rel[len(folder) + 1:]
+        if member not in quantity_members(manifest):
+            return None
+        return member_path(path, member)
+    return None
+
+
 def resolve_served_file(folder: str, raw_name: str) -> str | None:
     """Maps a requested name to a real file of the folder, or None.
 
@@ -163,9 +310,10 @@ def resolve_served_file(folder: str, raw_name: str) -> str | None:
 
 
 class LibraryHandler(BaseHTTPRequestHandler):
-    server_version = "QVisionLibrary/2.0"
+    server_version = "QVisionLibrary/3.0"
     protocol_version = "HTTP/1.1"
     folder: str = DEFAULT_FOLDER
+    quantities: str = ""
 
     # Quiet the default stderr access log: we log ourselves.
     def log_message(self, format: str, *args) -> None:  # noqa: A002 (stdlib signature)
@@ -210,7 +358,10 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 "QVision Library",
                 f"Folder: {self.folder}",
                 f"Scenes: {len(build_index(self.folder))}",
-                "GET /health, GET /index.json, GET /files/<name> (Range supported)",
+                f"Quantities folder: {self.quantities}",
+                f"Quantity packages: {len(quantity_package_dirs(self.quantities))}",
+                "GET /health, GET /index.json, GET /files/<name>, GET /quantities.json, "
+                "GET /q/<folder>/<path> (Range supported)",
             ]
             self._send_bytes(HTTPStatus.OK, ("\n".join(lines) + "\n").encode("utf-8"),
                              "text/plain; charset=utf-8", head_only)
@@ -219,7 +370,9 @@ class LibraryHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             scenes = sum(1 for name in folder_files(self.folder) if name.endswith(".usdz"))
-            body = json.dumps({"name": "QVision Library", "version": LIBRARY_VERSION, "scenes": scenes}).encode("utf-8")
+            quantities = len(quantity_package_dirs(self.quantities))
+            body = json.dumps({"name": "QVision Library", "version": LIBRARY_VERSION, "scenes": scenes,
+                               "quantities": quantities}).encode("utf-8")
             self._send_bytes(HTTPStatus.OK, body, "application/json; charset=utf-8", head_only)
             self._log(HTTPStatus.OK)
             return
@@ -229,6 +382,26 @@ class LibraryHandler(BaseHTTPRequestHandler):
             body = json.dumps(index, indent=2).encode("utf-8")
             self._send_bytes(HTTPStatus.OK, body, "application/json; charset=utf-8", head_only)
             self._log(HTTPStatus.OK, f"{len(index)} scene(s)")
+            return
+
+        if path == "/quantities.json":
+            try:
+                packages = build_quantities(self.quantities)
+            except OSError as error:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR,
+                            f"can't read the quantities folder: {error.strerror}", head_only)
+                return
+            body = json.dumps(packages, indent=2, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(HTTPStatus.OK, body, "application/json; charset=utf-8", head_only)
+            self._log(HTTPStatus.OK, f"{len(packages)} quantity package(s)")
+            return
+
+        if path.startswith("/q/"):
+            file_path = resolve_quantity_file(self.quantities, path[len("/q/"):])
+            if file_path is None:
+                self._error(HTTPStatus.NOT_FOUND, "no such package file", head_only)
+                return
+            self._stream_file(file_path, head_only)
             return
 
         if path.startswith("/files/"):
@@ -276,7 +449,8 @@ class LibraryHandler(BaseHTTPRequestHandler):
             return
         with handle:
             size = os.fstat(handle.fileno()).st_size
-            content_type = SERVED_TYPES.get(os.path.splitext(file_path)[1].lower(), "application/octet-stream")
+            ext = os.path.splitext(file_path)[1].lower()
+            content_type = SERVED_TYPES.get(ext) or QUANTITY_TYPES.get(ext, "application/octet-stream")
             byte_range = self._parse_range(size)
             if byte_range == "bad":
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
@@ -352,10 +526,12 @@ def lan_addresses() -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="QVision Library: serve baked Rendered scenes on the LAN.")
+    parser = argparse.ArgumentParser(description="QVision Library: serve baked Rendered scenes and quantity packages on the LAN.")
     parser.add_argument("folder", nargs="?", default=DEFAULT_FOLDER, help="folder with <Name>.usdz (+ .json, .jpg)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"TCP port (default {DEFAULT_PORT})")
     parser.add_argument("--bind", default="0.0.0.0", help="address to listen on (default all interfaces)")
+    parser.add_argument("--quantities", default=None,
+                        help="folder of quantity packages (default: 'Quantities' next to the scenes folder)")
     args = parser.parse_args(argv)
 
     folder = os.path.abspath(args.folder)
@@ -368,6 +544,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     LibraryHandler.folder = folder
+    LibraryHandler.quantities = os.path.abspath(args.quantities) if args.quantities else \
+        os.path.join(os.path.dirname(folder), "Quantities")
     try:
         httpd = ThreadingHTTPServer((args.bind, args.port), LibraryHandler)
     except OSError as error:
@@ -379,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
     scenes = build_index(folder)
     log(f"QVision Library serving {folder}")
     log(f"{len(scenes)} scene(s): " + (", ".join(s["file"] for s in scenes) if scenes else "none yet"))
+    packages = quantity_package_dirs(LibraryHandler.quantities)
+    log(f"Quantities folder {LibraryHandler.quantities}: {len(packages)} package(s)")
     addresses = lan_addresses()
     if addresses:
         for address in addresses:

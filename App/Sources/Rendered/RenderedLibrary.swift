@@ -624,7 +624,7 @@ final class RenderedLibrary {
 /// One HTTP GET written straight to a file, continuing at `offset` with a Range request.
 /// 206 = the server continues: append. 200 = it sends everything: start the file again.
 /// Thread-safe counters are polled from the main actor for the progress bar.
-private final class ResumableTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class ResumableTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let url: URL
     private let destination: URL
     private let offset: Int64

@@ -9,6 +9,8 @@ struct QVisionApp: App {
     @State private var server = ServerSessionController()
     /// Rendered mode (v0.8): baked scenes on this Vision Pro + the QVision Library on the PC.
     @State private var library = RenderedLibrary()
+    /// Quantities (v0.11): quantity packages on this Vision Pro + the QVision Library on the PC.
+    @State private var quantityLibrary = QuantityLibrary()
 
     init() {
         StageComponents.register()
@@ -24,8 +26,17 @@ struct QVisionApp: App {
                 .environment(model)
                 .environment(server)
                 .environment(library)
+                .environment(quantityLibrary)
         }
         .defaultSize(width: 760, height: 820)
+
+        // Quantities (v0.11): project switcher, Building visibility, article panel, tapped element.
+        WindowGroup(id: AppModel.quantitiesWindowID) {
+            QuantitiesWindowView()
+                .environment(model)
+                .environment(quantityLibrary)
+        }
+        .defaultSize(width: 1080, height: 820)
 
         // Project panel: a real window (system move bar underneath), opened/closed from the
         // palm button. Placed as a utility panel: close to the user, slightly below eye level.
@@ -80,6 +91,13 @@ struct QVisionApp: App {
                 .environment(library)
         }
         .immersionStyle(selection: .constant(FullImmersionStyle.full as any ImmersionStyle), in: .full)
+
+        // Quantities (v0.11): the project as a table-top model in your room (mixed).
+        ImmersiveSpace(id: AppModel.quantitiesSpaceID) {
+            QuantitiesImmersiveView()
+                .environment(model)
+        }
+        .immersionStyle(selection: .constant(MixedImmersionStyle.mixed as any ImmersionStyle), in: .mixed)
     }
 
     private var streamImmersionBinding: Binding<any ImmersionStyle> {
