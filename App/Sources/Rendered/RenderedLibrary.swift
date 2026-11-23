@@ -91,6 +91,7 @@ final class RenderedLibrary {
         let root = RenderedFiles.rootFolder()
         rootFolder = root
         RenderedFiles.removeLeftovers(in: root)
+        Self.removeEnvironmentPackages(in: root)
         hostOverride = UserDefaults.standard.string(forKey: Self.hostKey) ?? ""
         refresh()
     }
@@ -98,7 +99,8 @@ final class RenderedLibrary {
     // MARK: - On this Vision Pro
 
     func refresh() {
-        scenes = RenderedFiles.scan(root: rootFolder)
+        // v0.11.2: Environment packages (`"kind": "environment"`) are no longer shown.
+        scenes = RenderedFiles.scan(root: rootFolder).filter { $0.environment == nil }
         var found: [String: Int64] = [:]
         for folder in RenderedFiles.resumeFolders(in: rootFolder) {
             guard let meta = Self.loadResumeMeta(folder) else { continue }
@@ -375,7 +377,18 @@ final class RenderedLibrary {
         downloadTasks[id]?.cancel()
     }
 
-    // MARK: - Environments (v0.10)
+    // MARK: - Environments (v0.10, removed from the UI in v0.11.2)
+
+    /// v0.11.2: the user asked for the Environments (Tradition Place etc.) to go. At launch every
+    /// downloaded Environment package is deleted from Documents to free the space; `refresh` hides
+    /// any that come back (e.g. imported from Files). The helpers below stay for the viewer's
+    /// Environment code paths, which are unreachable now that no Environment scene can be opened.
+    private static func removeEnvironmentPackages(in root: URL) {
+        for scene in RenderedFiles.scan(root: root) where scene.environment != nil {
+            try? FileManager.default.removeItem(at: scene.folder)
+            RenderedViewer.forgetLastPose(sceneID: scene.id)
+        }
+    }
 
     /// Environment scenes on this Vision Pro in `group`, by `order` then title.
     func rooms(inGroup group: String?) -> [RenderedScene] {

@@ -11,8 +11,11 @@ import UIKit
 /// (`building`, v0.11.1: one mesh per layer and material; the main per-element USDZ is never
 /// loaded on the headset), plus the selection overlay that `ArchViewerQuantities` adds.
 /// Movement, rotation and scale only ever touch `placement`, so model and hatch stay together.
-/// Taps find their element through `QuantityPickIndex` (Data/pick.bin). The Move handle is a
-/// sibling of `placement` (it keeps its size).
+/// Taps find their element through `QuantityPickIndex` (Data/pick.bin).
+///
+/// v0.11.2: direct manipulation, no Move handle. A one-hand pinch-and-drag that starts on the model
+/// moves it freely in 3D; two hands scale it (magnify) and turn it about the vertical axis
+/// (rotate); a tap selects an element. "Lock model" (persisted) turns every input target off.
 @MainActor
 @Observable
 final class QuantitiesSession {
@@ -107,9 +110,18 @@ final class QuantitiesSession {
     /// Collision shapes for picking: 0...1 while they are generated, nil when done.
     private(set) var pickingProgress: Double? = nil
 
+    /// v0.11.2: locked = the model ignores all input (no move, scale, turn or tap selection), so
+    /// the quantities window always gets the pinch even when the model is in front of it.
+    var isLocked: Bool = UserDefaults.standard.bool(forKey: QuantitiesSession.lockKey) {
+        didSet {
+            guard isLocked != oldValue else { return }
+            UserDefaults.standard.set(isLocked, forKey: Self.lockKey)
+            applyLock()
+        }
+    }
+
     @ObservationIgnored let root = Entity()
     @ObservationIgnored private let placement = Entity()
-    @ObservationIgnored let handle: ModelEntity
     @ObservationIgnored private let hands: HandTrackingService
     @ObservationIgnored private var building: Entity? = nil
     @ObservationIgnored private var grabVolume: Entity? = nil
@@ -127,39 +139,35 @@ final class QuantitiesSession {
     @ObservationIgnored private var scale: Float = 0.01
     @ObservationIgnored private var fitScale: Float = 0.01
     @ObservationIgnored private var halfDiagonal: Float = 1
-    /// Horizontal unit vector from the model toward the user (where the Move handle sits).
-    @ObservationIgnored private var facing = SIMD3<Float>(0, 0, 1)
     @ObservationIgnored private var needsFirstPlacement = false
 
-    // Running gestures.
-    private enum Drag {
-        case rotate(startYaw: Float, startAngle: Float)
-        case slide(startYaw: Float, startPoint: SIMD3<Float>)
-        case move(startPosition: SIMD3<Float>, startPoint: SIMD3<Float>)
+    // Running gestures (v0.11.2).
+    /// The running one-hand drag: where the model and the hand were when it took hold.
+    private struct Drag {
+        let gestureStart: SIMD3<Float>
+        var anchorPosition: SIMD3<Float>?
+        var anchorPoint: SIMD3<Float>
+        var moving: Bool
     }
     @ObservationIgnored private var drag: Drag? = nil
-    @ObservationIgnored private var dragStartPoint: SIMD3<Float>? = nil
     @ObservationIgnored private var scaleStart: Float? = nil
+    @ObservationIgnored private var rotateStart: Float? = nil
+    /// When the last drag / two-hand gesture that changed the model ended (a tap right after it
+    /// is the end of that gesture, not a selection).
+    @ObservationIgnored private var lastManipulationEnd: TimeInterval = 0
 
     static let overlayName = "ArchViewerQuantitySelection"
+    private static let lockKey = "qv.quantities.lockModel"
     private static let tableExtent: Float = 1.2
     private static let tableHeight: Float = 0.9
-    private static let rotationGain: Float = 1.5
+    /// The hand must travel this far (scene metres) before a drag moves the model, so the small
+    /// wobble of a tap never moves it.
+    private static let dragDeadZone: Float = 0.012
 
     init(hands: HandTrackingService) {
         self.hands = hands
-        var material = UnlitMaterial(color: UIColor(white: 0.96, alpha: 1))
-        material.faceCulling = .none
-        handle = ModelEntity(mesh: .generateBox(width: 0.16, height: 0.014, depth: 0.045, cornerRadius: 0.007),
-                             materials: [material])
-        handle.name = "QVMoveHandle"
-        handle.components.set(InputTargetComponent())
-        handle.components.set(CollisionComponent(shapes: [.generateBox(width: 0.22, height: 0.05, depth: 0.09)]))
-        handle.components.set(HoverEffectComponent())
-        handle.isEnabled = false
         placement.name = "QVQuantitiesPlacement"
         root.addChild(placement)
-        root.addChild(handle)
     }
 
     var isReady: Bool { phase == .ready }
@@ -203,9 +211,8 @@ final class QuantitiesSession {
         hasContext = false
         pickingProgress = nil
         drag = nil
-        dragStartPoint = nil
         scaleStart = nil
-        handle.isEnabled = false
+        rotateStart = nil
         packageID = nil
         title = ""
         loadStarted = nil
@@ -263,9 +270,9 @@ final class QuantitiesSession {
             self.viewer = viewer
             self.pick = pickIndex
             hasContext = false
-            placeInFrontOfUser(resetYaw: true)
+            placeClearOfWindow(resetYaw: true)
+            applyLock()
             placement.isEnabled = true
-            handle.isEnabled = true
             phase = .ready
             loadStarted = nil
             startCollisions(building: building, token: token)
@@ -368,7 +375,7 @@ final class QuantitiesSession {
     // MARK: - Placement
 
     func recentre() {
-        placeInFrontOfUser(resetYaw: false)
+        placeClearOfWindow(resetYaw: false)
     }
 
     func setScalePreset(_ preset: ScalePreset) {
@@ -378,20 +385,35 @@ final class QuantitiesSession {
         let (head, _) = headAndForward()
         let flat = SIMD2<Float>(position.x - head.x, position.z - head.z)
         if simd_length(flat) < halfDiagonal * scale + 0.3 {
-            placeInFrontOfUser(resetYaw: false)
+            placeClearOfWindow(resetYaw: false)
         } else {
             applyPlacement()
         }
     }
 
-    /// The model's centre about 1 m in front of the user (further for a big scale), base at 0.9 m.
-    private func placeInFrontOfUser(resetYaw: Bool) {
+    /// v0.11.2: the window always wins. visionOS gives an immersive space no window positions,
+    /// but the quantities window opens straight ahead of the user (default placement, about
+    /// 1.1 m wide), and the Recentre button sits in that window, so the head's forward direction
+    /// points at the window when the model is placed. The model goes to the front-right, far
+    /// enough round that its whole footprint stays out of the window's angular span, with its
+    /// base well below eye level (under the window's lower edge). It never sits between the user
+    /// and the window, so it can't take the window's pinches. If the user later puts it in front
+    /// of the window, Recentre or Lock model gives the window back.
+    private func placeClearOfWindow(resetYaw: Bool) {
         let pose = hands.devicePose()
         needsFirstPlacement = (pose == nil)
         let (head, forward) = headAndForward(pose)
-        let distance = Swift.max(1.0, halfDiagonal * scale + 0.35)
-        position = SIMD3<Float>(head.x + forward.x * distance, Self.tableHeight, head.z + forward.z * distance)
-        facing = -forward
+        let right = SIMD3<Float>(-forward.z, 0, forward.x)
+        let radius = halfDiagonal * scale
+        let distance = Swift.max(0.9, radius + 0.45)
+        let windowHalfAngle: Float = 0.42          // ~24 degrees: half of a 1.1 m window at ~1.2 m
+        let modelHalfAngle = asin(Swift.min(radius / distance, 0.95))
+        let angle = Swift.min(windowHalfAngle + modelHalfAngle + 0.08, 1.25)   // at most ~72 degrees
+        let direction = forward * cos(angle) + right * sin(angle)
+        let baseHeight: Float = pose == nil
+            ? Self.tableHeight
+            : Swift.min(Swift.max(head.y - 0.7, 0.45), Self.tableHeight)
+        position = SIMD3<Float>(head.x + direction.x * distance, baseHeight, head.z + direction.z * distance)
         if resetYaw {
             yaw = 0
         }
@@ -413,15 +435,12 @@ final class QuantitiesSession {
         placement.transform = Transform(scale: SIMD3<Float>(repeating: scale),
                                         rotation: simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)),
                                         translation: position)
-        let reach = halfDiagonal * scale + 0.08
-        handle.position = position + facing * reach + SIMD3<Float>(0, -0.03, 0)
-        handle.orientation = simd_quatf(angle: atan2(facing.x, facing.z), axis: SIMD3<Float>(0, 1, 0))
     }
 
     /// Per frame: the first placement waits for head tracking if it wasn't there at load time.
     func updateFrame() {
         if needsFirstPlacement, phase == .ready, hands.devicePose() != nil {
-            placeInFrontOfUser(resetYaw: false)
+            placeClearOfWindow(resetYaw: false)
         }
     }
 
@@ -433,68 +452,84 @@ final class QuantitiesSession {
         volume.components.set(CollisionComponent(shapes: [
             ShapeResource.generateBox(size: size).offsetBy(translation: SIMD3<Float>(0, extents.y / 2, 0))
         ]))
-        volume.components.set(InputTargetComponent())
+        var target = InputTargetComponent()
+        target.isEnabled = !isLocked
+        volume.components.set(target)
         placement.addChild(volume)
         grabVolume = volume
     }
 
-    // MARK: - Gestures (all on `placement`)
+    // MARK: - Lock
 
-    func dragChanged(on entity: Entity, start: SIMD3<Float>, current: SIMD3<Float>) {
-        guard phase == .ready, scaleStart == nil else { return }
-        if drag == nil || dragStartPoint != start {
-            dragStartPoint = start
-            if entity === handle || entity.parent === handle {
-                drag = .move(startPosition: position, startPoint: start)
-            } else {
-                let v = start - position
-                if simd_length(SIMD2<Float>(v.x, v.z)) > 0.04 {
-                    drag = .rotate(startYaw: yaw, startAngle: atan2(v.x, v.z))
-                } else {
-                    drag = .slide(startYaw: yaw, startPoint: start)
-                }
-            }
+    /// Mirrors `isLocked` on every input target of the model: the building (its per-mesh
+    /// collision shapes inherit it), the coarse grab volume and the selection overlay.
+    private func applyLock() {
+        for entity in [building, grabVolume].compactMap({ $0 }) {
+            var target = entity.components[InputTargetComponent.self] ?? InputTargetComponent()
+            target.isEnabled = !isLocked
+            entity.components.set(target)
         }
-        guard let drag else { return }
-        switch drag {
-        case .move(let startPosition, let startPoint):
-            var next = startPosition + (current - startPoint)
-            next.y = Swift.min(Swift.max(next.y, 0.1), 2.5)
-            position = next
-            let (head, _) = headAndForward()
-            let toUser = SIMD3<Float>(head.x - position.x, 0, head.z - position.z)
-            if simd_length(toUser) > 0.05 { facing = simd_normalize(toUser) }
-        case .rotate(let startYaw, let startAngle):
-            let v = current - position
-            guard simd_length(SIMD2<Float>(v.x, v.z)) > 0.02 else { return }
-            yaw = startYaw + Self.rotationGain * Self.wrap(atan2(v.x, v.z) - startAngle)
-        case .slide(let startYaw, let startPoint):
-            let right = simd_cross(SIMD3<Float>(0, 1, 0), facing)
-            yaw = startYaw + 3 * simd_dot(current - startPoint, right)
+        viewer?.setOverlayInput(!isLocked)
+        if isLocked {
+            cancelDrag()
+            scaleStart = nil
+            rotateStart = nil
         }
+    }
+
+    // MARK: - Gestures (v0.11.2: direct manipulation, all on `placement`)
+
+    private var acceptsInput: Bool { phase == .ready && !isLocked }
+
+    /// One hand: the model follows the pinch in 3D (left/right, up/down, nearer/further).
+    func dragChanged(start: SIMD3<Float>, current: SIMD3<Float>) {
+        guard acceptsInput, scaleStart == nil, rotateStart == nil else { return }
+        if drag == nil || drag?.gestureStart != start {
+            drag = Drag(gestureStart: start, anchorPosition: position, anchorPoint: start, moving: false)
+        }
+        guard var running = drag else { return }
+        guard let anchorPosition = running.anchorPosition else {
+            // A two-hand gesture took over and ended while this hand kept pinching: go on from here.
+            running.anchorPosition = position
+            running.anchorPoint = current
+            running.moving = true
+            drag = running
+            return
+        }
+        let delta = current - running.anchorPoint
+        if !running.moving {
+            guard simd_length(delta) > Self.dragDeadZone else { return }
+            running.moving = true
+            drag = running
+        }
+        var next = anchorPosition + delta
+        next.y = Swift.min(Swift.max(next.y, 0), 2.5)
+        position = next
         applyPlacement()
     }
 
     func dragEnded() {
+        if drag?.moving == true { lastManipulationEnd = ProcessInfo.processInfo.systemUptime }
         drag = nil
-        dragStartPoint = nil
+    }
+
+    /// A second hand joins (or the model locks): undo what the one-hand drag did.
+    private func cancelDrag() {
+        guard var running = drag else { return }
+        if let anchorPosition = running.anchorPosition, running.moving {
+            position = anchorPosition
+            applyPlacement()
+        }
+        running.anchorPosition = nil
+        running.moving = false
+        drag = running
     }
 
     func magnifyChanged(_ factor: Float) {
-        guard phase == .ready, factor.isFinite, factor > 0 else { return }
+        guard acceptsInput, factor.isFinite, factor > 0 else { return }
         if scaleStart == nil {
             scaleStart = scale
-            // A two-hand pinch: undo what the first hand's drag started.
-            switch drag {
-            case .rotate(let startYaw, _)?, .slide(let startYaw, _)?:
-                yaw = startYaw
-            case .move(let startPosition, _)?:
-                position = startPosition
-            case nil:
-                break
-            }
-            drag = nil
-            dragStartPoint = nil
+            cancelDrag()
         }
         guard let start = scaleStart else { return }
         scale = Swift.min(Swift.max(start * factor, 0.0005), 0.2)
@@ -503,25 +538,40 @@ final class QuantitiesSession {
     }
 
     func magnifyEnded() {
+        guard scaleStart != nil else { return }
         scaleStart = nil
+        lastManipulationEnd = ProcessInfo.processInfo.systemUptime
         if abs(scale - fitScale) / fitScale < 0.03 { scalePreset = .table }
         for preset in ScalePreset.allCases {
             if let factor = preset.factor, abs(scale - factor) / factor < 0.03 { scalePreset = preset }
         }
     }
 
-    private static func wrap(_ angle: Float) -> Float {
-        var a = angle
-        while a > .pi { a -= 2 * .pi }
-        while a < -.pi { a += 2 * .pi }
-        return a
+    /// Two hands turning: `angle` (radians, counter-clockwise seen from above) since the start.
+    func rotateChanged(_ angle: Float) {
+        guard acceptsInput, angle.isFinite else { return }
+        if rotateStart == nil {
+            rotateStart = yaw
+            cancelDrag()
+        }
+        guard let start = rotateStart else { return }
+        yaw = start + angle
+        applyPlacement()
+    }
+
+    func rotateEnded() {
+        guard rotateStart != nil else { return }
+        rotateStart = nil
+        lastManipulationEnd = ProcessInfo.processInfo.systemUptime
     }
 
     // MARK: - Tap an element
 
     func handleTap(on entity: Entity, scenePoint: SIMD3<Float>) async {
-        guard phase == .ready, let viewer, let building else { return }
-        if entity === handle || entity.parent === handle { return }
+        guard acceptsInput, let viewer, let building else { return }
+        // A drag (or a two-hand gesture) is never a tap.
+        guard drag?.moving != true, scaleStart == nil, rotateStart == nil,
+              ProcessInfo.processInfo.systemUptime - lastManipulationEnd > 0.3 else { return }
         if entity === grabVolume {
             tapped = Tapped(elementId: nil, detail: "", articles: [], part: nil, otherPartsHere: 0,
                             message: "Element picking is still being prepared. Try again in a moment.")

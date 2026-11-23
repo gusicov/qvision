@@ -2,21 +2,20 @@ import SwiftUI
 import RealityKit
 import simd
 
-/// Content of `ImmersiveSpace(id: AppModel.quantitiesSpaceID)` (mixed): the table-top model,
-/// its Move handle and the shared palm menu (Exit · Recentre · Normal view).
+/// Content of `ImmersiveSpace(id: AppModel.quantitiesSpaceID)` (mixed): the table-top model and
+/// the shared palm menu (Exit · Recentre · Normal view).
 ///
-/// Gestures (all applied to the placement parent by `QuantitiesSession`):
-/// - drag on the model: turn it about its vertical axis;
-/// - drag the Move handle: move it;
-/// - pinch with both hands: scale;
-/// - tap an element: its articles in the window.
+/// Gestures (v0.11.2, direct manipulation; all applied to the placement parent by
+/// `QuantitiesSession`, and all ignored while "Lock model" is on):
+/// - one hand, pinch and drag the model: move it freely in 3D;
+/// - two hands (magnify): scale it;
+/// - two hands turning (rotate about the vertical axis): turn it;
+/// - tap an element: its articles in the window (a drag is never a tap).
 struct QuantitiesImmersiveView: View {
     @Environment(AppModel.self) private var model
 
     @State private var updateSubscription: EventSubscription?
     @State private var palmState = PalmMenuState()
-
-    private static let moveLabelID = "qvMoveLabel"
 
     var body: some View {
         RealityView { content, attachments in
@@ -25,12 +24,6 @@ struct QuantitiesImmersiveView: View {
             if let menu = attachments.entity(for: PalmMenuPlacement.attachmentID) {
                 PalmMenuPlacement.install(menu, in: palmState)
                 content.add(menu)
-            }
-            // A label from a previous opening of this space goes first.
-            for child in Array(session.handle.children) { child.removeFromParent() }
-            if let label = attachments.entity(for: Self.moveLabelID) {
-                label.position = SIMD3<Float>(0, 0.04, 0)
-                session.handle.addChild(label)
             }
             let frameModel = model
             let frameState = palmState
@@ -49,17 +42,10 @@ struct QuantitiesImmersiveView: View {
                 QuantitiesPalmMenu()
                     .environment(model)
             }
-            Attachment(id: Self.moveLabelID) {
-                Label("Move", systemImage: "arrow.up.and.down.and.arrow.left.and.right")
-                    .font(.caption.weight(.semibold))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .glassBackgroundEffect(in: Capsule())
-                    .allowsHitTesting(false)
-            }
         }
         .gesture(dragGesture)
         .simultaneousGesture(magnifyGesture)
+        .simultaneousGesture(rotateGesture)
         .simultaneousGesture(tapGesture)
         .installsSceneActions()
         .onAppear {
@@ -92,7 +78,7 @@ struct QuantitiesImmersiveView: View {
             .onChanged { value in
                 let start = value.convert(value.startLocation3D, from: .local, to: .scene)
                 let current = value.convert(value.location3D, from: .local, to: .scene)
-                model.quantities.dragChanged(on: value.entity, start: start, current: current)
+                model.quantities.dragChanged(start: start, current: current)
             }
             .onEnded { _ in
                 model.quantities.dragEnded()
@@ -107,6 +93,21 @@ struct QuantitiesImmersiveView: View {
             }
             .onEnded { _ in
                 model.quantities.magnifyEnded()
+            }
+    }
+
+    /// Two hands turning about the vertical axis. SwiftUI's 3D space is y-down: mirrored into
+    /// RealityKit the axis keeps its y, so the yaw change is the angle signed by axis.y.
+    private var rotateGesture: some Gesture {
+        RotateGesture3D(constrainedToAxis: .y)
+            .targetedToAnyEntity()
+            .onChanged { value in
+                let rotation = value.rotation
+                let sign: Double = rotation.axis.y < 0 ? -1 : 1
+                model.quantities.rotateChanged(Float(rotation.angle.radians * sign))
+            }
+            .onEnded { _ in
+                model.quantities.rotateEnded()
             }
     }
 

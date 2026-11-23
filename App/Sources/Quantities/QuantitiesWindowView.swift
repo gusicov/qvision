@@ -134,8 +134,16 @@ struct QuantitiesWindowView: View {
                     Label("Recentre", systemImage: "scope")
                 }
                 .disabled(!session.isReady)
+                // v0.11.2: locked = the model ignores every input (move, scale, turn, tap).
+                Toggle(isOn: Binding(get: { session.isLocked }, set: { session.isLocked = $0 })) {
+                    Label("Lock model", systemImage: session.isLocked ? "lock.fill" : "lock.open")
+                }
+                .toggleStyle(.button)
+                .accessibilityLabel("Lock model")
             }
-            Text("Drag the model to turn it · drag the Move bar in front of it to move it · pinch with both hands to scale · tap an element to see its articles.")
+            Text(session.isLocked
+                 ? "The model is locked: it ignores pinches and taps. Unlock it to move, scale, turn or tap it."
+                 : "Pinch and drag the model to move it · two hands to scale and turn it · tap an element to see its articles.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

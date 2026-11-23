@@ -33,10 +33,8 @@ struct RenderedHomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     ContinueCard()
-                    EnvironmentsSection()
-                    if !(classicScenes.isEmpty && hasEnvironments) {
-                        localSection
-                    }
+                    // v0.11.2: the Environments section is gone (see RenderedLibrary).
+                    localSection
                     pcSection
                     howToSection
                 }
@@ -140,17 +138,14 @@ struct RenderedHomeView: View {
 
     // MARK: - On this Vision Pro
 
-    /// v0.10: classic Rendered scenes (Environments have their own section above).
+    /// Classic Rendered scenes (v0.11.2: `RenderedLibrary` already drops Environment packages).
     private var classicScenes: [RenderedScene] {
         library.scenes.filter { $0.environment == nil }
     }
 
+    /// The PC's entries without Environment packages (v0.11.2: hidden, never downloaded).
     private var classicEntries: [LibraryEntry] {
         library.entries.filter { !library.isEnvironment($0) }
-    }
-
-    private var hasEnvironments: Bool {
-        library.scenes.contains { $0.environment != nil } || library.entries.contains { library.isEnvironment($0) }
     }
 
     private var localSection: some View {
@@ -353,7 +348,7 @@ struct RenderedHomeView: View {
                     message: "Bake a scene on the PC (Bake-Rendered.cmd) or put <Name>.usdz with its .json and .jpg into the Rendered folder. It appears here by itself."
                 )
             } else if classicEntries.isEmpty {
-                Text("Everything on your PC is an Environment: see Environments above.")
+                Text("Your PC has no Rendered scenes to download.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .qvCard(padding: 16)

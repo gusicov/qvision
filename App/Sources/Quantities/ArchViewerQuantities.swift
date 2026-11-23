@@ -13,6 +13,8 @@ final class ArchViewerQuantities {
     let building: Entity
     private let reviewContext: Entity?
     private let overlayRoot = Entity()
+    /// QVision v0.11.2 (Lock model): false = the overlay's pick targets are off.
+    private(set) var overlayInputEnabled = true
     private let hatch: UnlitMaterial
     private let ink: UnlitMaterial
     private var savedOpacity: OpacityComponent?
@@ -110,7 +112,9 @@ final class ArchViewerQuantities {
                 let shape = try await ShapeResource.generateStaticMesh(from: resource)
                 try check(token)
                 node.components.set(CollisionComponent(shapes: [shape]))
-                node.components.set(InputTargetComponent())
+                var target = InputTargetComponent()
+                target.isEnabled = overlayInputEnabled
+                node.components.set(target)
             }
             staging.addChild(node)
         }
@@ -158,6 +162,20 @@ final class ArchViewerQuantities {
             context.components.set(OpacityComponent(opacity: contextOpacity))
         } else {
             building.components.set(OpacityComponent(opacity: contextOpacity))
+        }
+    }
+
+    /// QVision v0.11.2 (Lock model): turns the overlay's pick targets on or off, now and for
+    /// overlays built later.
+    func setOverlayInput(_ enabled: Bool) {
+        overlayInputEnabled = enabled
+        var stack = Array(overlayRoot.children)
+        while let node = stack.popLast() {
+            if var target = node.components[InputTargetComponent.self] {
+                target.isEnabled = enabled
+                node.components.set(target)
+            }
+            stack.append(contentsOf: node.children)
         }
     }
 
