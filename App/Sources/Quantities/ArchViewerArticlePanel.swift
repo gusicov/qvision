@@ -160,7 +160,7 @@ struct ArchViewerArticlePanel: View {
                     Text([part.section, part.level, part.facade, part.evidence].filter { !$0.isEmpty }.joined(separator: " · "))
                         .font(.caption).foregroundStyle(.secondary)
                     if let amount = part.basis {
-                        Text("Registered element basis · " + amount.formatted(.number.precision(.fractionLength(0...5))) + " " + (part.basisUnit ?? ""))
+                        Text(basisText(amount, unit: part.basisUnit))
                             .font(.caption.monospacedDigit())
                     } else {
                         Text("The register gives this location without an individual quantity.").font(.caption)
@@ -179,6 +179,13 @@ struct ArchViewerArticlePanel: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // QVision: split out of the view body (the expression timed out the type checker on CI).
+    private func basisText(_ amount: Double, unit: String?) -> String {
+        let number: String = amount.formatted(.number.precision(.fractionLength(0...5)))
+        let suffix: String = unit ?? ""
+        return "Registered element basis · " + number + " " + suffix
     }
 
     private func choose(_ index: Int) {

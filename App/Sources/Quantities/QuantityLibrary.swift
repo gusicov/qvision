@@ -378,7 +378,7 @@ final class QuantityLibrary {
         let listed = Set(entry.files.keys)
         if let enumerator = fm.enumerator(at: staging, includingPropertiesForKeys: [.isRegularFileKey]) {
             let prefix = staging.standardizedFileURL.path + "/"
-            for case let url as URL in enumerator {
+            for case let url as URL in enumerator.allObjects {
                 guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
                 let relative = String(url.standardizedFileURL.path.dropFirst(prefix.count))
                 if !listed.contains(relative) { try? fm.removeItem(at: url) }
