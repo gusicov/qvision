@@ -79,7 +79,22 @@ def mat_class(mat, cfg):
     b = principled(mat)
     if b and b.inputs['Alpha'].is_linked:
         return 'alpha'
+    if mix_alpha(mat):
+        return 'alpha'
     return 'normal'
+
+
+def mix_alpha(mat):
+    """Cut-out built as Mix Shader(Transparent, surface) with a linked factor -> (fac socket, transparent_is_first)."""
+    if not mat or not mat.node_tree:
+        return None
+    for n in mat.node_tree.nodes:
+        if n.type != 'MIX_SHADER' or not n.inputs[0].is_linked:
+            continue
+        for k in (1, 2):
+            if n.inputs[k].is_linked and n.inputs[k].links[0].from_node.type == 'BSDF_TRANSPARENT':
+                return (n.inputs[0].links[0].from_socket, k == 1)
+    return None
 
 
 def setup_gpu(scene):
@@ -203,6 +218,34 @@ def stage_prep(a, cfg):
             bpy.data.objects.remove(o, do_unlink=True); n_rm += 1
     log('removed hidden', n_rm)
 
+    # 1b) realize instances: collection instances (asset libraries) and geometry-nodes scatters become real objects
+    if cfg.get('realize_instances', True):
+        for _ in range(4):
+            inst = [o for o in sc.objects if o.instance_type == 'COLLECTION' and o.instance_collection
+                    and o.visible_get(view_layer=vl) and not o.hide_render]
+            if not inst:
+                break
+            for o in sc.objects:
+                o.select_set(False)
+            for o in inst:
+                o.select_set(True)
+            vl.objects.active = inst[0]
+            bpy.ops.object.duplicates_make_real(use_base_parent=False, use_hierarchy=False)
+            for o in inst:
+                o.instance_type = 'NONE'
+            log('realized collection instances', len(inst))
+        gn = [o for o in sc.objects if o.type == 'MESH' and any(m.type == 'NODES' and m.show_render for m in o.modifiers)
+              and o.visible_get(view_layer=vl) and not o.hide_render]
+        for o in gn:
+            for m in o.modifiers:
+                m.show_viewport = m.show_render
+            for x in sc.objects:
+                x.select_set(False)
+            o.select_set(True); vl.objects.active = o
+            bpy.ops.object.convert(target='MESH')      # applies the modifiers and realizes their instances
+        if gn:
+            log('geometry-nodes objects realized', [o.name for o in gn])
+
     # 2) convert curves/text to mesh, apply render modifiers, make single-user, apply transforms
     for o in sc.objects:
         for m in getattr(o, 'modifiers', []):
@@ -265,7 +308,8 @@ def stage_prep(a, cfg):
     log('split objects', n_split)
 
     # 4) bake-friendly materials: metals -> darkened dielectric (diffuse bake has no glossy), mirrors -> grey
-    for mat in bpy.data.materials:
+    #    (skipped when the bake includes glossy reflections from the viewing point)
+    for mat in ([] if cfg.get('bake', {}).get('glossy') else bpy.data.materials):
         b = principled(mat)
         if not b:
             continue
@@ -295,16 +339,18 @@ def stage_prep(a, cfg):
                 c = bc.default_value
                 bc.default_value = (c[0] * k, c[1] * k, c[2] * k, 1)
 
-    # 5) lights, sky, colour management, cycles
-    for L in bpy.data.lights:
-        if L.type != 'SUN':
-            L.energy *= cfg.get('lamp_scale', 1.0)
-    setup_lighting(sc, cfg)
+    # 5) lights, sky, colour management, cycles (keep_lighting: the source blend's own setup is the reference)
+    if not cfg.get('keep_lighting'):
+        for L in bpy.data.lights:
+            if L.type != 'SUN':
+                L.energy *= cfg.get('lamp_scale', 1.0)
+        setup_lighting(sc, cfg)
     setup_gpu(sc)
     cy = sc.cycles
-    cy.max_bounces = 12; cy.diffuse_bounces = 6; cy.glossy_bounces = 3; cy.transmission_bounces = 8
-    cy.transparent_max_bounces = 16; cy.sample_clamp_indirect = 10.0
-    cy.caustics_reflective = False; cy.caustics_refractive = False
+    if not cfg.get('keep_lighting'):
+        cy.max_bounces = 12; cy.diffuse_bounces = 6; cy.glossy_bounces = 3; cy.transmission_bounces = 8
+        cy.transparent_max_bounces = 16; cy.sample_clamp_indirect = 10.0
+        cy.caustics_reflective = False; cy.caustics_refractive = False
     for me in bpy.data.meshes:
         if me.users == 0:
             bpy.data.meshes.remove(me)
@@ -825,8 +871,16 @@ def bake_alpha_mask(objs, img, cfg):
             next(n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL')
         prev = out.inputs['Surface'].links[0].from_socket if out.inputs['Surface'].is_linked else None
         em = nt.nodes.new('ShaderNodeEmission'); em.name = 'QV_MASK'
+        mx = mix_alpha(m)
         if b and b.inputs['Alpha'].is_linked:
             nt.links.new(b.inputs['Alpha'].links[0].from_socket, em.inputs['Color'])
+        elif mx:
+            fac, transparent_first = mx
+            if transparent_first:      # Mix(fac=0 -> transparent, fac=1 -> surface): opacity = fac
+                nt.links.new(fac, em.inputs['Color'])
+            else:
+                inv = nt.nodes.new('ShaderNodeMath'); inv.name = 'QV_MASK_INV'; inv.operation = 'SUBTRACT'
+                inv.inputs[0].default_value = 1.0; nt.links.new(fac, inv.inputs[1]); nt.links.new(inv.outputs[0], em.inputs['Color'])
         else:
             v = b.inputs['Alpha'].default_value if b else 1.0
             em.inputs['Color'].default_value = (v, v, v, 1)
@@ -838,6 +892,8 @@ def bake_alpha_mask(objs, img, cfg):
         for m, out, prev, em in saved:
             nt = m.node_tree
             nt.nodes.remove(em)
+            if nt.nodes.get('QV_MASK_INV'):
+                nt.nodes.remove(nt.nodes['QV_MASK_INV'])
             if prev is not None:
                 nt.links.new(prev, out.inputs['Surface'])
 
@@ -845,7 +901,8 @@ def bake_alpha_mask(objs, img, cfg):
 def stage_bake(a, cfg):
     sc = bpy.context.scene
     setup_gpu(sc)
-    setup_lighting(sc, cfg)          # always bake with the CURRENT config sun/sky
+    if not cfg.get('keep_lighting'):
+        setup_lighting(sc, cfg)      # always bake with the CURRENT config sun/sky
     cy = sc.cycles
     cy.use_denoising = False
     try:
@@ -870,7 +927,10 @@ def stage_bake(a, cfg):
         size = A['size']; t = time.time()
         img = new_float_image('QV_bake_%d' % i, size)
         cy.samples = a.samples or cfg['bake']['samples']
-        bake_one('COMBINED', {'EMIT', 'DIRECT', 'INDIRECT', 'DIFFUSE', 'TRANSMISSION'}, objs, img, cfg)
+        passes = {'EMIT', 'DIRECT', 'INDIRECT', 'DIFFUSE', 'TRANSMISSION'}
+        if cfg['bake'].get('glossy'):
+            passes.add('GLOSSY')     # reflections seen from the active camera (render.bake.view_from)
+        bake_one('COMBINED', passes, objs, img, cfg)
         tb = time.time() - t
         alb = new_float_image('QV_albedo_%d' % i, size)
         cy.samples = cfg['bake']['albedo_samples']
@@ -1110,7 +1170,7 @@ def stage_export(a, cfg):
             mats[(i, variant)] = m
     glass_mats = {}
     for gname, (r, g, bb, op) in cfg.get('glass_tint', {}).items():
-        m = bpy.data.materials.new('QV_Glass' if gname == 'Glass' else 'QV_Glass_' + gname)
+        m = bpy.data.materials.new('QV_Glass' if gname == 'Glass' else 'QV_Glass_' + re.sub(r'[^A-Za-z0-9]+', '_', gname).strip('_'))
         b = principled(m)
         b.inputs['Base Color'].default_value = (r, g, bb, 1); b.inputs['Alpha'].default_value = op
         b.inputs['Roughness'].default_value = 0.05; b.inputs['Specular IOR Level'].default_value = 0.0
@@ -1120,6 +1180,10 @@ def stage_export(a, cfg):
     for o in mesh_objects():
         me = o.data
         names = [s.material.name if s.material else '' for s in o.material_slots]
+        if o.get('qv_keep_material'):       # e.g. an environment's panorama sphere: exported as authored
+            del o['qv_keep_material']
+            groups.setdefault('K_' + o.name, []).append(o)
+            continue
         if o.get('qv_kind') == 'glass' or (o.material_slots and all(mat_class(s_.material, cfg) == 'glass' for s_ in o.material_slots)):
             gm = next((glass_mats[k] for k in glass_mats if any(re.search('^' + k + '$', n) for n in names)), None) \
                 or glass_mats.get('Glass')
@@ -1172,9 +1236,10 @@ def stage_export(a, cfg):
                           export_lights=False, export_cameras=False, convert_world_material=False,
                           triangulate_meshes=True, root_prim_path='/root',
                           convert_scene_units='METERS', export_custom_properties=False)
-    opac = {m.name: principled(m).inputs['Alpha'].default_value for m in bpy.data.materials
+    usdname = lambda n: re.sub(r'[^A-Za-z0-9_]', '_', n)     # how the USD exporter names material prims
+    opac = {usdname(m.name): principled(m).inputs['Alpha'].default_value for m in bpy.data.materials
             if principled(m) and not principled(m).inputs['Alpha'].is_linked and principled(m).inputs['Alpha'].default_value < 0.999}
-    cut = [m.name for m in bpy.data.materials if principled(m) and principled(m).inputs['Alpha'].is_linked]
+    cut = [usdname(m.name) for m in bpy.data.materials if principled(m) and principled(m).inputs['Alpha'].is_linked]
     from pxr import Usd, UsdShade, UsdGeom, UsdUtils, Sdf
     st = Usd.Stage.Open(usdc)
     for prim in st.Traverse():
@@ -1215,22 +1280,20 @@ def stage_export(a, cfg):
                   'yawDegrees: rotation about +Y (counter-clockwise seen from above), 0 = facing -Z. '
                   'Materials are display-referred sRGB: show them UNLIT. Glass materials are named "*Glass*" and carry opacity.')
                  % (bpy.app.version_string, cfg['bake']['samples'], cfg['view']['look'], cfg['view']['exposure'],
-                    cfg['sun']['elevation'], cfg['sun']['azimuth']),
+                    cfg.get('sun', {}).get('elevation', 0.0), cfg.get('sun', {}).get('azimuth', 0.0)),
     }
     with open(os.path.join(out, name + '.json'), 'w', encoding='utf-8') as f:
         json.dump(side, f, indent=2)
     stats = {'triangles': tris, 'usdz_bytes': size, 'start_blender': list(p), 'start_floor_object': floor_obj,
              'start_clearance_m': clr, 'atlases': atlases}
-    with open(os.path.join(out, 'work', 'export_stats.json'), 'w') as f:
+    with open(os.path.join(os.path.dirname(cfg['_work']), cfg['name'] + '_export_stats.json'), 'w') as f:
         json.dump(stats, f, indent=1)
     log('sidecar', side)
 
 
 # ----------------------------------------------------------------------------------------------- stage: verify
-def stage_verify(a, cfg):
-    import numpy as np
-    name = cfg['name']; out = cfg['out_dir']
-    usdz = os.path.join(out, name + '.usdz')
+def verify_setup(cfg, usdz, samples=None):
+    """Fresh scene with the USDZ imported and every material emission-only (the headset look). Returns the scene."""
     bpy.ops.wm.read_factory_settings(use_empty=True)
     sc = bpy.context.scene
     bpy.ops.wm.usd_import(filepath=usdz, import_lights=False, import_cameras=False)
@@ -1270,9 +1333,18 @@ def stage_verify(a, cfg):
     bg = next(n for n in w.node_tree.nodes if n.type == 'BACKGROUND')
     bg.inputs['Color'].default_value = (0.42, 0.62, 0.92, 1)        # stand-in for the app's sky dome
     setup_gpu(sc)
-    sc.cycles.samples = a.samples or 24; sc.cycles.use_denoising = False
+    sc.cycles.use_denoising = False
     sc.cycles.max_bounces = 0; sc.cycles.transparent_max_bounces = 16
     sc.view_settings.view_transform = 'Standard'; sc.view_settings.look = 'None'; sc.view_settings.exposure = 0
+    sc.cycles.samples = samples or 24
+    return sc
+
+
+def stage_verify(a, cfg):
+    import numpy as np
+    name = cfg['name']; out = cfg['out_dir']
+    usdz = os.path.join(out, name + '.usdz')
+    sc = verify_setup(cfg, usdz, a.samples)
     W = a.res or 1280; H = int(W * 0.625)
     sc.render.resolution_x = W; sc.render.resolution_y = H; sc.render.resolution_percentage = 100
     sc.render.image_settings.file_format = 'JPEG'; sc.render.image_settings.quality = 90

@@ -399,5 +399,82 @@
         15.0
       ]
     }
-  ]
+  ],
+  "environment_example": {
+    "_comment": "Separate config for qv_env.py (one Environment package per room). Copy to <project>.json (git-ignored).",
+    "name": "My_Project",
+    "title": "My Project",
+    "group": "My Project",
+    "src": "C:\\path\\to\\your_model.blend",
+    "ref_dir": "C:\\path\\to\\reference_renders",
+    "out_dir": "C:\\All Docs\\06_Apple vision pro\\assets\\Rendered",
+    "work_subdir": "work_myproject",
+    "view_layer": "",
+    "frame": 1,
+    "keep_lighting": true,
+    "keep_cameras": true,
+    "remove_collections": [],
+    "view": {
+      "transform": "AgX",
+      "look": "AgX - Medium High Contrast",
+      "exposure": 0.0
+    },
+    "glass_materials": [
+      "^Glass$"
+    ],
+    "glass_tint": {
+      "Glass": [
+        0.86,
+        0.92,
+        0.94,
+        0.14
+      ]
+    },
+    "translucent_materials": {},
+    "mirror_materials": [],
+    "atlas_size": 4096,
+    "island_margin_px": 6,
+    "bake": {
+      "samples": 512,
+      "albedo_samples": 16,
+      "margin_px": 16,
+      "tile": 2048,
+      "glossy": true
+    },
+    "export": {
+      "jpeg_quality": 90
+    },
+    "has_sky": true,
+    "env": {
+      "radius_m": 1.5,
+      "eye_points": 64,
+      "eye_height_min": 1.2,
+      "eye_height_max": 1.8,
+      "eye_height_center": 1.6,
+      "vis_res": 4096,
+      "far_m": 12.0,
+      "texel_near_mm": 1.0,
+      "texel_per_m_mm": 0.5,
+      "unseen_texel_mm": 40.0,
+      "drop_unseen_area_m2": 0.02,
+      "max_atlases": 12,
+      "max_triangles": 800000,
+      "pano_size": 8192,
+      "pano_samples": 256,
+      "sphere_radius_m": 500.0,
+      "pano_collections": []
+    },
+    "rooms": [
+      {
+        "id": "01",
+        "order": 1,
+        "title": "Living room",
+        "camera": "Camera name in the blend",
+        "ref": "01 - Living.png",
+        "env": {
+          "far_m": 12.0
+        }
+      }
+    ]
+  }
 }

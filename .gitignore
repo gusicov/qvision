@@ -9,4 +9,5 @@ dist/
 
 # Local bake configs point at private client files
 tools/bake/casa_sua.json
+tools/bake/tradition_place.json
 tools/bake/__pycache__/
